@@ -213,9 +213,9 @@ class PiterCheat:
         self.script.on('message', self.on_message)
         self.script.load()
 
-        # Init hooks
-        print("[+] Agent injected. Waiting for hooks...")
-        self.script.exports.init()
+        # Agent auto-inits on load (no exports needed)
+        print("[+] Agent injected (auto-init)...")
+        print(f"[!] Piter Agent v10 loaded")
 
         print(f"\n  Type /help for commands")
         print(f"  {'─'*50}")
