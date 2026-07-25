@@ -1,8 +1,9 @@
 /**
- * Piter Cheat Engine — Frida Agent (Phase 1)
- * ============================================
+ * Piter Cheat Engine — Frida Agent (v6)
+ * =======================================
  * Injected into Growtopia process via Frida.
  * Hooks ENet, tank protocol, and game packets.
+ * macOS focused — `sendto`, `sendmsg`, `write` fallback.
  */
 'use strict';
 
@@ -29,21 +30,16 @@ function scanPattern(pattern, moduleName) {
     try {
         const mod = Process.findModuleByName(moduleName || 'Growtopia');
         if (!mod) return [];
-        
         const results = [];
         const patternStr = pattern.replace(/\s/g, '');
         const bytes = [];
-        
         for (let i = 0; i < patternStr.length; i += 2) {
             const b = patternStr.substr(i, 2);
             bytes.push(b === '??' ? null : parseInt(b, 16));
         }
-        
         const base = mod.base;
         const size = mod.size;
         const buf = base.readByteArray(size);
-        
-        let matchStart = 0;
         for (let i = 0; i <= size - bytes.length; i++) {
             let matched = true;
             for (let j = 0; j < bytes.length; j++) {
@@ -52,13 +48,10 @@ function scanPattern(pattern, moduleName) {
                     break;
                 }
             }
-            if (matched) {
-                results.push(base.add(i));
-            }
+            if (matched) results.push(base.add(i));
         }
         return results;
     } catch (e) {
-        console.log('[!] Pattern scan error: ' + e);
         return [];
     }
 }
@@ -68,15 +61,11 @@ function scanStrings(term, maxResults) {
     try {
         const mod = Process.findModuleByName('Growtopia');
         if (!mod) return [];
-        
         const results = [];
-        const base = mod.base;
-        const size = mod.size;
-        
-        Memory.scan(base, size, term, {
+        Memory.scan(mod.base, mod.size, term, {
             onMatch(address) {
                 try {
-                    let str = address.readCString();
+                    const str = address.readCString();
                     if (str && str.length > 2 && str.length < 256) {
                         results.push({ address: address, value: str });
                     }
@@ -84,185 +73,180 @@ function scanStrings(term, maxResults) {
             },
             onComplete() {}
         });
-        
         return results.slice(0, maxResults || 50);
     } catch (e) {
         return [];
     }
 }
 
-// ──── ENet Send Hook ────
-function htons(port) {
-    return ((port & 0xff) << 8) | ((port >> 8) & 0xff);
+// ──── ENet Send/Recv Hooks ────
+function hookEnetSend() {
+    const methods = ['sendto', 'sendmsg', 'send', 'write'];
+    let hooked = false;
+    const errors = [];
+
+    for (let i = 0; i < methods.length; i++) {
+        const name = methods[i];
+        let addr = Module.findExportByName(null, name);
+
+        if (!addr) addr = Module.findExportByName('libsystem_c.dylib', name);
+        if (!addr) addr = Module.findExportByName('libSystem.B.dylib', name);
+        if (!addr) addr = Module.findExportByName('/usr/lib/libSystem.B.dylib', name);
+
+        if (addr) {
+            try {
+                // Capture `name` in closure so it stays correct
+                const fnName = name;
+                Interceptor.attach(addr, {
+                    onEnter(args) {
+                        const buf = args[1];
+                        let len = 0;
+                        try { len = args[2].toInt32(); } catch(e) {}
+                        if (len > 0 && len < 65536) {
+                            try {
+                                const data = Memory.readByteArray(buf, len);
+                                if (data) handleOutboundPacket(data);
+                            } catch(e) {}
+                        }
+                    }
+                });
+                hooked = true;
+                send({ status: 'hook_ok', fn: name });
+                break;
+            } catch (e) {
+                errors.push(name + ': ' + e.message);
+            }
+        } else {
+            errors.push(name + ': not found');
+        }
+    }
+
+    if (!hooked) {
+        send({ status: 'hook_failed', errors: errors });
+        // Fallback: hook raw write() without socket filtering
+        tryWriteFallback();
+    }
+
+    return hooked;
 }
 
-function hookEnetSend() {
-    try {
-        // Try multiple module names (macOS vs Windows vs Linux)
-        let moduleNames = ['Growtopia', 'Growtopia.app', null, 'Growtopia.exe'];
-        let enetModule = null;
-        for (const name of moduleNames) {
-            try { enetModule = Process.findModuleByName(name); if (enetModule) break; } catch(e) {}
-        }
-        
-        if (!enetModule) {
-            // On macOS, the main executable might not be found by name — try enumerate
-            try {
-                const mods = Process.enumerateModules();
-                for (const m of mods) {
-                    if (m.name.toLowerCase().includes('growtopia') || 
-                        m.name.toLowerCase().includes('gt') ||
-                        m.path.toLowerCase().includes('growtopia')) {
-                        enetModule = m;
-                        break;
+function tryWriteFallback() {
+    const writePtr = Module.findExportByName(null, 'write');
+    if (!writePtr) {
+        send({ status: 'hook_failed', info: 'no write() either' });
+        return;
+    }
+
+    Interceptor.attach(writePtr, {
+        onEnter(args) {
+            const buf = args[1];
+            let len = 0;
+            try { len = args[2].toInt32(); } catch(e) {}
+            if (len > 3 && len < 65536) {
+                try {
+                    const data = Memory.readByteArray(buf, len);
+                    // Quick heuristic: does it look like an ENet packet?
+                    const peek = new Uint8Array(data);
+                    if (peek[0] === 0x01 || peek[0] === 0x04 || peek[0] === 0x02) {
+                        handleOutboundPacket(data);
+                    } else {
+                        // Check for pipe-delimited tank data
+                        for (let i = 0; i < Math.min(len, 100); i++) {
+                            if (peek[i] === 0x7c) { // '|' character
+                                handleOutboundPacket(data);
+                                break;
+                            }
+                        }
                     }
-                }
-            } catch(e) {}
-            
-            if (!enetModule) {
-                console.log('[!] Module detection failed — falling back to system hooks only');
-            } else {
-                console.log('[+] Found module: ' + enetModule.name + ' @ ' + enetModule.base);
+                } catch(e) {}
             }
         }
-        
-        let hooksOk = 0;
-        
-        // Hook sendto() — intercept all UDP writes
-        const sendtoPtr = Module.findExportByName(null, 'sendto');
-        if (sendtoPtr) {
-            Interceptor.attach(sendtoPtr, {
-                onEnter(args) {
-                    this.sockfd = args[0].toInt32();
-                    this.buf = args[1];
-                    this.len = args[2].toInt32();
-                    this.flags = args[3].toInt32();
-                    this.addr = args[4];
-                    this.addrlen = args[5].toInt32();
-                },
-                onLeave(retval) {
-                    try {
-                        if (this.addrlen >= 8 && this.len > 0) {
-                            const family = this.addr.readU16();
-                            if (family === 2) {
-                                // Read port correctly (network byte order)
-                                const rawPort = this.addr.add(2).readU16();
-                                // Normalize port regardless of endianness
-                                const portBigEndian = ((rawPort >> 8) & 0xff) | ((rawPort & 0xff) << 8);
-                                if (portBigEndian === 17091 || rawPort === 17091 || portBigEndian === 43847 || rawPort === 43847) {
-                                    const len = Math.min(this.len, 512);
-                                    const data = this.buf.readByteArray(len);
-                                    handleOutboundPacket(data);
-                                }
-                            }
+    });
+    send({ status: 'hook_ok', fn: 'write(fallback)' });
+}
+
+function hookEnetRecv() {
+    let hooked = false;
+    const methods = ['recvfrom', 'recv', 'recvmsg', 'read'];
+
+    for (let i = 0; i < methods.length; i++) {
+        const name = methods[i];
+        let addr = Module.findExportByName(null, name);
+
+        if (!addr) addr = Module.findExportByName('libsystem_c.dylib', name);
+        if (!addr) addr = Module.findExportByName('libSystem.B.dylib', name);
+
+        if (addr) {
+            try {
+                Interceptor.attach(addr, {
+                    onEnter(args) {
+                        this.buf = args[1];
+                    },
+                    onLeave(retval) {
+                        const ret = retval.toInt32();
+                        if (ret > 0 && ret < 65536) {
+                            try {
+                                const data = Memory.readByteArray(this.buf, ret);
+                                if (data) handleInboundPacket(data);
+                            } catch(e) {}
                         }
-                    } catch (e) {}
-                }
-            });
-            hooksOk++;
-            console.log('[+] sendto() hooked');
-        } else {
-            console.log('[!] sendto() not found');
+                    }
+                });
+                hooked = true;
+                send({ status: 'hook_ok', fn: name + '(recv)' });
+                break;
+            } catch (e) {}
         }
-        
-        // Hook recvfrom for inbound
-        const recvfromPtr = Module.findExportByName(null, 'recvfrom');
-        if (recvfromPtr) {
-            Interceptor.attach(recvfromPtr, {
-                onEnter(args) {
-                    this.buf = args[1];
-                    this.len = args[2].toInt32();
-                    this.addr = args[4];
-                    this.addrlen = args[5].toInt32();
-                },
-                onLeave(retval) {
-                    const ret = retval.toInt32();
-                    if (ret <= 0 || !this.addrlen || this.addrlen < 8) return;
-                    try {
-                        const family = this.addr.readU16();
-                        if (family === 2) {
-                            const rawPort = this.addr.add(2).readU16();
-                            const portBigEndian = ((rawPort >> 8) & 0xff) | ((rawPort & 0xff) << 8);
-                            if (portBigEndian === 17091 || rawPort === 17091 || portBigEndian === 43847 || rawPort === 43847) {
-                                const len = Math.min(ret, 2048);
-                                const data = this.buf.readByteArray(len);
-                                handleInboundPacket(data);
-                            }
-                        }
-                    } catch (e) {}
-                }
-            });
-            hooksOk++;
-            console.log('[+] recvfrom() hooked');
-        } else {
-            console.log('[!] recvfrom() not found');
-        }
-        
-        state.hooksActive = (hooksOk > 0);
-        return state.hooksActive;
-    } catch (e) {
-        console.log('[!] Hook error: ' + e.message + '\\n' + e.stack);
-        return false;
     }
+
+    if (!hooked) {
+        send({ status: 'hook_warn', info: 'no recv hook — outbound only' });
+    }
+
+    return hooked;
 }
 
 // ──── Packet Handlers ────
 function handleOutboundPacket(data) {
     try {
         const arr = new Uint8Array(data);
+        if (arr.length < 4) return;
+
         const hex = Array.from(arr.slice(0, 32)).map(b => b.toString(16).padStart(2, '0')).join('');
-        
-        // Detect packet type
-        let ptype = 'UNKNOWN';
+        let ptype = 'DATA';
         let summary = '';
-        
+
         if (arr[0] === 0x01 && arr[1] === 0x00 && arr[2] === 0x00 && arr[3] === 0x00) {
             ptype = 'ENET_CONNECT';
-        } else if (arr[0] === 0x04 || arr[1] === 0x00) {
+        } else {
             // Try to decode as text
             const text = String.fromCharCode.apply(null, arr.filter(b => b >= 32 && b < 127));
-            
+
             // Look for tank fields
             const tankMatch = text.match(/requestedName\|([^\n]+)/);
             if (tankMatch) state.growId = tankMatch[1];
-            
+
             const passMatch = text.match(/tankIDPass\|([^\n]+)/);
             if (passMatch) state.password = passMatch[1];
-            
+
             const tokenMatch = text.match(/_token=([^\n&]+)/);
             if (tokenMatch) state.token = tokenMatch[1];
-            
+
             if (tankMatch || passMatch) {
                 ptype = 'ENET_LOGIN';
-                summary = `GROWID: ${state.growId} | PASS: ${state.password ? state.password.substring(0,3)+'***' : '?'}`;
+                summary = 'GROWID: ' + state.growId + ' | PASS: ' + (state.password ? state.password.substring(0,3)+'***' : '?');
             } else if (text.includes('action|')) {
                 ptype = 'GAME_ACTION';
                 summary = text.substring(0, 80);
-                
-                const actionMatch = text.match(/action\|([^\n]+)/);
-                if (actionMatch) {
-                    const action = actionMatch[1];
-                    if (action === 'enter_game') summary = 'action|enter_game (JOINED)';
-                }
+                if (text.includes('enter_game')) summary = 'action|enter_game (JOINED)';
             } else if (text.includes('tileChange')) {
                 ptype = 'TILE_CHANGE';
                 summary = text.substring(0, 80);
+            } else if (text.length > 2) {
+                summary = text.substring(0, 60);
             }
         }
-        
-        // Check for GameUpdatePacket (type 4)
-        if (arr[0] === 0x04 && arr.length > 4) {
-            ptype = 'GAME_UPDATE';
-            try {
-                // Parse 4-byte header
-                const netId = (arr[4] | (arr[5] << 8) | (arr[6] << 16) | (arr[7] << 24)) >>> 0;
-                const itemId = (arr[8] | (arr[9] << 8)) & 0xFFFF;
-                const x = (arr[10] | (arr[11] << 8)) & 0xFFFF;
-                const y = (arr[12] | (arr[13] << 8)) & 0xFFFF;
-                summary = `item=${itemId} pos=(${x},${y})`;
-            } catch (e) {}
-        }
-        
+
         // Log
         state.packetLog.unshift({
             dir: 'OUT',
@@ -273,49 +257,38 @@ function handleOutboundPacket(data) {
             time: Date.now()
         });
         if (state.packetLog.length > state.maxPacketLog) state.packetLog.pop();
-        
-        // Send to Python controller
+
         send({
             event: 'packet_out',
             type: ptype,
             size: arr.length,
             summary: summary
         });
-        
-    } catch (e) {
-        console.log('[!] Outbound handler error: ' + e);
-    }
+
+    } catch (e) {}
 }
 
 function handleInboundPacket(data) {
     try {
         const arr = new Uint8Array(data);
-        
-        // Look for text data
+        if (arr.length < 4) return;
+
         const text = String.fromCharCode.apply(null, arr.filter(b => b >= 32 && b < 127));
-        
         let ptype = 'SERVER';
         let summary = '';
-        
+
         if (text.includes('OnSuperMainStart')) {
             ptype = 'WORLD_JOIN';
-            summary = 'ENTERED WORLD';
-            
-            // Parse world name
             const nameMatch = text.match(/OnSuperMainStart[^\n]*/);
             if (nameMatch) {
                 const parts = nameMatch[0].split('|');
-                if (parts.length > 1) {
-                    state.worldName = parts[1] || '';
-                    // Extract more fields
-                    for (const part of parts) {
-                        if (part.includes('base_uid')) state.netId = parseInt(part.split('=')[1]) || 0;
-                        if (part.includes('credits')) state.gems = parseInt(part.split('=')[1]) || 0;
-                    }
+                if (parts.length > 1) state.worldName = parts[1] || '';
+                for (const part of parts) {
+                    if (part.includes('base_uid')) state.netId = parseInt(part.split('=')[1]) || 0;
+                    if (part.includes('credits')) state.gems = parseInt(part.split('=')[1]) || 0;
                 }
             }
-            summary = `WORLD: ${state.worldName} | GEMS: ${state.gems} | NETID: ${state.netId}`;
-            
+            summary = 'WORLD: ' + state.worldName + ' | GEMS: ' + state.gems + ' | NETID: ' + state.netId;
         } else if (text.includes('action|')) {
             ptype = 'GAME_ACTION';
             summary = text.substring(0, 100);
@@ -325,11 +298,12 @@ function handleInboundPacket(data) {
         } else if (text.includes('remove_player')) {
             ptype = 'PLAYER_LEAVE';
             summary = text.substring(0, 100);
+        } else if (text.length > 2) {
+            summary = text.substring(0, 60);
         }
-        
-        // Hex
+
         const hex = Array.from(arr.slice(0, 32)).map(b => b.toString(16).padStart(2, '0')).join('');
-        
+
         state.packetLog.unshift({
             dir: 'IN',
             type: ptype,
@@ -339,27 +313,22 @@ function handleInboundPacket(data) {
             time: Date.now()
         });
         if (state.packetLog.length > state.maxPacketLog) state.packetLog.pop();
-        
+
         send({
             event: 'packet_in',
             type: ptype,
             size: arr.length,
             summary: summary
         });
-        
-    } catch (e) {
-        console.log('[!] Inbound handler error: ' + e);
-    }
+
+    } catch (e) {}
 }
 
-// ──── Command Handlers ────
-
-// Memory scanner
+// ──── Commands ────
 function scanMemory(searchTerm) {
     return scanStrings(searchTerm, 50);
 }
 
-// Get current state
 function getState() {
     return {
         growId: state.growId,
@@ -372,17 +341,13 @@ function getState() {
     };
 }
 
-// Get recent packets
 function getPackets(count) {
     return state.packetLog.slice(0, count || 20);
 }
 
-// Inject packet (placeholder — needs proper ENet packet building)
 function injectPacket(dataHex) {
     try {
-        // WARNING: Could crash the client if malformed
         console.log('[!] Packet injection not yet implemented safely');
-        // TODO: Build proper ENet packet and call enet_peer_send
     } catch (e) {
         console.log('[!] Inject error: ' + e);
     }
@@ -393,33 +358,32 @@ recv('command', function(msg) {
     try {
         switch (msg.cmd) {
             case 'scan':
-                const results = scanMemory(msg.term);
-                send({ event: 'scan_result', data: results });
+                send({ event: 'scan_result', data: scanMemory(msg.term) });
                 break;
-            
+
             case 'state':
                 send({ event: 'state', data: getState() });
                 break;
-            
+
             case 'packets':
                 send({ event: 'packets', data: getPackets(msg.count) });
                 break;
-            
+
             case 'inject':
                 injectPacket(msg.data);
                 send({ event: 'injected', success: true });
                 break;
-            
+
             case 'hook_stats':
-                send({ 
-                    event: 'hook_stats', 
+                send({
+                    event: 'hook_stats',
                     hooks: state.hooksActive,
                     packets: state.packetLog.length,
                     growId: state.growId,
                     world: state.worldName
                 });
                 break;
-            
+
             default:
                 send({ event: 'error', msg: 'Unknown command: ' + msg.cmd });
         }
@@ -429,12 +393,14 @@ recv('command', function(msg) {
 });
 
 // ──── Init ────
-console.log('[!] Piter Frida Agent loaded');
+console.log('[!] Piter Frida Agent v6 loaded');
 console.log('[!] Hooking ENet send/recv...');
 
 setTimeout(() => {
-    const ok = hookEnetSend();
-    send({ event: 'ready', hooksOk: ok, module: 'Growtopia' });
+    const okSend = hookEnetSend();
+    const okRecv = hookEnetRecv();
+    state.hooksActive = okSend || okRecv;
+    send({ event: 'ready', hooksOk: state.hooksActive, sendHook: okSend, recvHook: okRecv });
 }, 500);
 
 // Keep alive
