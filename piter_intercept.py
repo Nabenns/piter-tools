@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Piter Tools — Mac Interceptor (pf-based MITM)
-=============================================
-Full man-in-the-middle for Growtopia on macOS.
-Redirects all outbound UDP port 17091 traffic through our proxy
-where we can READ, MODIFY, DROP, or REPLAY any packet.
+Piter Interceptor v4 — Auto MITM Proxy
+======================================
+Self-contained MITM for Growtopia on macOS / Linux.
+NO pf, NO DNS override needed — just run and open GT.
 
-SETUP (one time):
-  sudo pfctl -e                                    # enable packet filter
-  sudo echo "rdr pass on en0 proto udp from any to any port 17091 -> 127.0.0.1 port 7091" | sudo pfctl -f -
-  sudo python3 piter_intercept.py                  # start intercept
-  # Open Growtopia and login
+HOW IT WORKS:
+  Binds to 0.0.0.0:17091 directly. Your GT client must be DNS-redirected
+  to this machine (or localhost). Pair with /etc/hosts:
+    127.0.0.1 www.growtopia1.com
+    103.129.148.178 logingtps.preman.my.id  (loginurl — keep real)
 
-CLEANUP:
-  sudo pfctl -d                                    # disable packet filter
+  For local machine usage, use the auto-mode that detects if GT connects.
+
+MODES:
+  python3 piter_intercept.py local   — for same machine as GT (default)
+  python3 piter_intercept.py remote  — for remote MITM
+  
+REQUIRES: Python 3.7+, root/sudo only.
 """
 
 import socket
@@ -22,297 +26,376 @@ import sys
 import time
 import select
 import threading
-import json
 import os
+import subprocess
+import re
 from datetime import datetime
 from collections import defaultdict
 
 PITER_IP = "103.129.148.178"
 PITER_PORT = 17091
-PROXY_PORT = 7091  # Redirect pf 17091→7091 here
 
-# ──── Colors ────
+# ──── ANSI ────
 GREEN = '\033[92m'
 RED = '\033[91m'
 YELLOW = '\033[93m'
 CYAN = '\033[96m'
 BOLD = '\033[1m'
 RESET = '\033[0m'
+MAGENTA = '\033[95m'
 
 
 class PiterInterceptor:
-    """MITM proxy that intercepts ALL GT→Piter traffic."""
+    """Full MITM proxy — intercept, view, modify, drop, inject."""
     
-    def __init__(self):
-        self.client_sock = None
-        self.server_sock = None
+    def __init__(self, mode='local'):
+        self.mode = mode
         self.running = True
         self.packet_count = 0
+        self.listen_sock = None
+        self.client_addr = None
         
-        # Track what we've seen
         self.session = {
             'grow_id': '',
             'password': '',
             'token': '',
             'uid': '',
             'world': '',
-            'items': [],
             'players': set(),
+            'actions': [],
+            'last_activity': 0,
         }
         
-        # Modification rules
-        self.drop_rules = []
+        self.drop_rules = set()
         self.modify_rules = {}
         self.inject_queue = []
-        
-        # Stats
+        self.stored_packets = []
         self.stats = defaultdict(int)
-        
-        # UI state
-        self.ui_mode = 'full'  # full, minimal, silent
     
     def start(self):
-        """Start MITM proxy."""
-        print(f"\n{BOLD}{CYAN}╔══════════════════════════════════════════╗{RESET}")
-        print(f"{BOLD}{CYAN}║   PITER INTERCEPTOR — Full MITM Proxy   ║{RESET}")
-        print(f"{BOLD}{CYAN}╚══════════════════════════════════════════╝{RESET}")
-        print(f"\n{YELLOW}[*] Listening on 0.0.0.0:{PROXY_PORT}{RESET}")
-        print(f"{YELLOW}[*] Forwarding to {PITER_IP}:{PITER_PORT}{RESET}")
-        print(f"{YELLOW}[*] Run: sudo pfctl -e && echo 'rdr pass proto udp from any to any port 17091 -> 127.0.0.1 port {PROXY_PORT}' | sudo pfctl -f -{RESET}")
-        print(f"{YELLOW}[*] Then open Growtopia and login{RESET}")
-        print(f"\n  {BOLD}Commands (type while running):{RESET}")
-        print(f"  d <num>     - Drop packet #<num>")
-        print(f"  m <num> <data> - Modify packet #<num>")  
-        print(f"  i <data>    - Inject packet")
-        print(f"  s           - Show session info")
-        print(f"  w           - Show world/players")
-        print(f"  q           - Quit")
+        print(f"\n{BOLD}{CYAN}{'═'*50}{RESET}")
+        print(f"{BOLD}{CYAN}  PITER INTERCEPTOR v4 — Auto MITM{RESET}")
+        print(f"{BOLD}{CYAN}{'═'*50}{RESET}")
+        print(f"\n  {YELLOW}Mode:{RESET} {self.mode}")
+        print(f"  {YELLOW}Listen:{RESET} 0.0.0.0:{PITER_PORT}")
+        print(f"  {YELLOW}Target:{RESET} {PITER_IP}:{PITER_PORT}")
         print()
         
-        # Start admin thread for user commands
+        if self.mode == 'local':
+            print(f"  {GREEN}[SETUP] Make sure /etc/hosts has:{RESET}")
+            print(f"    127.0.0.1 www.growtopia1.com")
+            print(f"    (Keep logingtps.preman.my.id → {PITER_IP})")
+            print()
+        
+        print(f"  {BOLD}Commands:{RESET}")
+        print(f"  s          — Session (GrowID, password, world)")
+        print(f"  w          — World info + players")
+        print(f"  d <N>      — Drop packet #N")
+        print(f"  m <N> <T>  — Modify packet #N content")
+        print(f"  i <TEXT>   — Inject action packet")
+        print(f"  x <TEXT>   — Inject ENET raw packet")
+        print(f"  p <N>      — Replay packet #N")
+        print(f"  stats      — Proxy statistics")
+        print(f"  q          — Quit")
+        print()
+        
+        # Start admin thread
         admin_thread = threading.Thread(target=self._admin_loop, daemon=True)
         admin_thread.start()
         
-        try:
-            self._main_loop()
-        except KeyboardInterrupt:
-            self._cleanup()
+        self._main_loop()
     
     def _main_loop(self):
-        """Main proxy loop - intercept + forward."""
-        # Create listening socket for redirected traffic
-        listen_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listen_sock.bind(('0.0.0.0', PROXY_PORT))
+        """Main MITM loop."""
+        self.listen_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
-        # Create socket for forwarding to real server
+        try:
+            self.listen_sock.bind(('0.0.0.0', PITER_PORT))
+        except PermissionError:
+            print(f"  {RED}[!] Need root to bind port 17091.{RESET}")
+            print(f"  {RED}[!] Run: sudo python3 piter_intercept.py local{RESET}")
+            self.running = False
+            return
+        except OSError as e:
+            print(f"  {RED}[!] Can't bind port 17091: {e}{RESET}")
+            print(f"  {RED}[!] Port might be in use. Kill GT first.{RESET}")
+            self.running = False
+            return
+        
         forward_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        forward_sock.settimeout(0.1)
+        forward_sock.settimeout(0.5)
         
-        # Map of (remote_addr) → last source port (for response routing)
-        client_map = {}
+        stored_packets = []  # For replay
+        pending_responses = {}  # client_addr → server response
         
-        print(f"  {GREEN}[READY] Waiting for GT client to connect...{RESET}\n")
+        print(f"  {GREEN}[READY] Waiting for GT client... (open Growtopia now){RESET}")
+        print(f"  {YELLOW}         Login URL still uses real server: {PITER_IP}:443{RESET}")
+        print()
         
         while self.running:
             try:
-                data, addr = listen_sock.recvfrom(65535)
-            except:
+                data, addr = self.listen_sock.recvfrom(65535)
+            except (OSError, socket.timeout):
                 continue
             
             self.packet_count += 1
             pkt_num = self.packet_count
+            self.session['last_activity'] = time.time()
             
-            # Determine direction
+            # First packet from client → store as client addr
+            if self.client_addr is None and addr[0] != PITER_IP:
+                self.client_addr = addr
+                print(f"  {GREEN}[CONNECTED] GT client detected: {addr[0]}:{addr[1]}{RESET}\n")
+            
+            # Direction
             if addr[0] == PITER_IP:
-                direction = "← SERVER"
-                color = CYAN
+                direction = "←"
+                is_from_server = True
             else:
-                direction = "→ CLIENT"
-                color = YELLOW
+                direction = "→"
+                is_from_server = False
             
-            # Extract readable info
-            info = self._analyze_packet(data, direction)
+            # Analyze
+            info = self._analyze(data)
+            info['size'] = len(data)
+            info['pkt_num'] = pkt_num
             
-            # Check drop rules
-            should_drop = self._check_drop_rules(pkt_num, data)
+            # Store for replay
+            stored_packets.append(data)
             
-            # Check modify rules
-            original_data = data
-            data = self._apply_modify_rules(pkt_num, data)
-            was_modified = data != original_data
+            # Check drop
+            should_drop = pkt_num in self.drop_rules or info.get('drop_trigger', False)
+            
+            # Check modify
+            original = data
+            if pkt_num in self.modify_rules:
+                new_text = self.modify_rules[pkt_num]
+                data = new_text.encode() if isinstance(new_text, str) else new_text
+                was_modified = True
+            else:
+                was_modified = False
             
             # Log
-            if self.ui_mode != 'silent':
-                self._log_packet(pkt_num, direction, len(data), info, should_drop, was_modified, color)
+            self._log(pkt_num, direction, info, should_drop, was_modified)
             
-            # Update session state
+            # Update session
             self._update_session(info)
             
-            # Forward to real server (if not dropping)
-            if not should_drop:
-                if direction == "→ CLIENT":
-                    # Forward client → server
+            # If from GT client and not dropped → forward to Piter
+            if not is_from_server and not should_drop:
+                try:
                     forward_sock.sendto(data, (PITER_IP, PITER_PORT))
-                    
-                    # Store client addr for response routing
-                    client_map[addr] = True
                     
                     # Get server response
                     try:
-                        resp, srv_addr = forward_sock.recvfrom(65535)
+                        resp, _ = forward_sock.recvfrom(65535)
                         if resp:
-                            # Also intercept server response
-                            resp_info = self._analyze_packet(resp, "← SERVER")
                             self.packet_count += 1
-                            
-                            if self.ui_mode != 'silent':
-                                self._log_packet(self.packet_count, "← SERVER", len(resp), resp_info, False, False, CYAN)
-                            
+                            resp_info = self._analyze(resp)
+                            resp_info['size'] = len(resp)
+                            self._log(self.packet_count, "←", resp_info, False, False)
                             self._update_session(resp_info)
+                            stored_packets.append(resp)
                             
-                            # Send back to client
-                            listen_sock.sendto(resp, addr)
+                            # Send back to GT client
+                            self.listen_sock.sendto(resp, addr)
                     except socket.timeout:
                         pass
+                    
+                except Exception as e:
+                    print(f"  {RED}[ERR] Forward failed: {e}{RESET}")
+            
+            # If from Piter server → send back to GT client directly
+            elif is_from_server and not should_drop:
+                if self.client_addr:
+                    self.listen_sock.sendto(data, self.client_addr)
             
             # Process injection queue
-            if self.inject_queue:
-                inject_data = self.inject_queue.pop(0)
-                forward_sock.sendto(inject_data, (PITER_IP, PITER_PORT))
-                print(f"  {RED}[INJECT] Sent {len(inject_data)}B to server{RESET}")
+            if self.inject_queue and self.client_addr:
+                inj = self.inject_queue.pop(0)
+                print(f"  {MAGENTA}[INJECT] {inj[:80]}{RESET}")
+                forward_sock.sendto(inj.encode() if isinstance(inj, str) else inj, 
+                                   (PITER_IP, PITER_PORT))
     
-    def _analyze_packet(self, data: bytes, direction: str) -> dict[str, object]:
-        """Extract meaningful info from packet."""
-        info: dict[str, object] = {'raw_size': len(data)}
+    def _analyze(self, data: bytes) -> dict:
+        """Extract all readable info from packet."""
+        info = {'raw': data}
         
         if len(data) < 4:
-            info['type'] = 'TOO_SMALL'
+            info['type'] = 'tiny'
             return info
         
-        # Try to decode as text
+        # ENet header
+        if data[:4] == b'\x01\x00\x00\x00':
+            info['enet'] = 'CONNECT'
+            info['type'] = 'handshake'
+        elif len(data) >= 4 and data[1] == 0 and data[2] == 0 and data[3] == 0:
+            if data[0] == 0:
+                info['enet'] = 'VERIFY'
+            else:
+                info['enet'] = f'PEER{data[0]}'
+        
+        # Try text decode
         try:
-            text = data.decode('utf-8', errors='replace')
+            text = data.decode('utf-8', errors='ignore')
             
-            # Login fields
-            for field in ['requestedName', 'tankIDName', 'tankIDPass', '_token']:
+            # Login fields (pipe-delimited)
+            for field in ['requestedName', 'tankIDName', 'tankIDPass',
+                          'password', 'growId', '_token', 'ltoken',
+                          'country', 'mac', 'game_version', 'platformID']:
                 if field in text:
-                    for line in text.split('\n'):
-                        if field in line:
-                            key, val = line.split('|', 1) if '|' in line else (field, '?')
-                            info[field] = val.strip()
+                    idx = text.find(field)
+                    end = text.find('\n', idx) if '\n' in text[idx:] else len(text)
+                    line = text[idx:end]
+                    if '|' in line:
+                        _, val = line.split('|', 1)
+                    else:
+                        val = line
+                    info[field] = val.strip()[:100]
             
             # Actions
             if 'action|' in text:
-                for line in text.split('\n'):
-                    if 'action|' in line:
-                        _, action = line.split('|', 1)
-                        info['action'] = action.strip()
+                idx = text.find('action|')
+                end = text.find('\n', idx) if '\n' in text[idx:] else len(text)
+                line = text[idx:end]
+                if '|' in line:
+                    info['action'] = line.split('|', 1)[1].strip()[:80]
             
-            # World info
-            if 'world|' in text or 'WORLD_NAME|' in text:
-                for line in text.split('\n'):
+            # Messages
+            if 'msg|' in text:
+                idx = text.find('msg|')
+                end = text.find('\n', idx) if '\n' in text[idx:] else len(text)
+                line = text[idx:end]
+                if '|' in line:
+                    info['message'] = line.split('|', 1)[1].strip()[:80]
+            
+            # World name
+            for key in ['world', 'WORLD_NAME', 'worldName', 'name']:
+                if key + '|' in text:
+                    idx = text.find(key + '|')
+                    end = text.find('\n', idx) if '\n' in text[idx:] else len(text)
+                    line = text[idx:end]
                     if '|' in line:
-                        k, v = line.split('|', 1)
-                        info[k.strip()] = v.strip()
+                        info['world'] = line.split('|', 1)[1].strip()[:80]
             
-            # Players
-            if 'player|' in text or 'PlayerInfo|' in text:
-                info['has_player_info'] = True
+            # Player info
+            if 'PlayerInfo' in text or 'playerInfo' in text or 'netID|' in text:
+                info['has_players'] = True
             
             # Items
-            if 'item|' in text or 'itemID|' in text:
-                info['has_item_info'] = True
+            if 'itemID' in text or 'item|' in text or 'inventory' in text.lower():
+                info['has_items'] = True
             
-            # General text extraction
-            printable = ''.join(c if 32 <= ord(c) < 127 else '.' for c in text)
-            info['printable'] = printable[:100]
+            # Extract all pipe fields
+            all_fields = {}
+            for line in text.split('\n'):
+                if '|' in line:
+                    key, _, val = line.partition('|')
+                    all_fields[key.strip()] = val.strip()
+            if all_fields:
+                info['fields'] = all_fields
+            
+            # Readable text
+            printable = text[:200].replace('\n', '↵').replace('\r', '')
+            printable = ''.join(c if 32 <= ord(c) < 127 or c == '↵' else '.' for c in printable)
+            info['text'] = printable[:200]
             
         except:
             pass
         
-        # ENet protocol analysis
-        if len(data) >= 4:
-            if data[:4] == b'\x01\x00\x00\x00':
-                info['enet'] = 'CONNECT'
-            elif data[0] in (0, 1, 2, 3) and data[1] == 0:
-                info['enet'] = f'PEER_{data[0]}'
-            
-            # Check for GT header
-            if data[0] == 4:
-                info['type'] = 'TANK_PACKET'
-            elif data[0] in (2, 3):
-                info['type'] = 'TEXT_PACKET'
+        # GT packet type
+        if len(data) >= 4 and data[0] == 4:
+            info['gt_type'] = 'TANK'
+        elif len(data) >= 1 and data[0] in (2, 3):
+            info['gt_type'] = 'GAME_DATA'
+        
+        # Hex
+        info['hex'] = data[:32].hex()
         
         return info
     
+    def _log(self, num: int, direction: str, info: dict, drop: bool, mod: bool):
+        """Log packet to console."""
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        size = info.get('size', 0)
+        
+        color = CYAN if direction == '←' else YELLOW
+        if drop:
+            color = RED
+        elif mod:
+            color = MAGENTA
+        
+        # Build summary
+        parts = []
+        
+        if 'requestedName' in info:
+            pw = info.get('tankIDPass', '?')
+            if pw and len(pw) > 3:
+                pw = pw[:3] + '***'
+            parts.append(f"LOGIN: {info['requestedName']}")
+        elif 'action' in info:
+            parts.append(f"ACTION: {info['action'][:50]}")
+        elif 'world' in info:
+            parts.append(f"WORLD: {info['world']}")
+        elif 'message' in info:
+            parts.append(f"MSG: {info['message'][:50]}")
+        elif 'enet' in info:
+            parts.append(info['enet'])
+        elif 'fields' in info and info['fields']:
+            keys = list(info['fields'].keys())[:3]
+            parts.append(f"FIELDS: {keys}")
+        elif 'text' in info:
+            text = info['text']
+            if any(c.isalpha() for c in text[:10]):
+                parts.append(f"TEXT: {text[:60]}")
+            else:
+                parts.append(f"{size}B binary")
+        else:
+            parts.append(f"{size}B")
+        
+        summary = ' | '.join(parts) if parts else f"{size}B"
+        
+        flags = ''
+        if drop:
+            flags = f'{RED}[DROP]{RESET} '
+        if mod:
+            flags += f'{MAGENTA}[MOD]{RESET} '
+        
+        print(f"  [{ts}] {color}#{num:04d} {direction}{RESET} {size:>4}B {flags}{summary}")
+    
     def _update_session(self, info: dict):
-        """Update session state from packet info."""
+        """Update session state from packet."""
         if 'requestedName' in info:
             self.session['grow_id'] = info['requestedName']
-            print(f"  {RED}[!!!] PLAYER LOGGING IN: {info['requestedName']}{RESET}")
+            print(f"  {RED}{BOLD}[!!!] PLAYER: {info['requestedName']}{RESET}")
         
         if 'tankIDPass' in info:
-            self.session['password'] = info['tankIDPass']
-            masked = info['tankIDPass'][:3] + '*' * max(0, len(info['tankIDPass'])-3)
-            print(f"  {RED}[!!!] PASSWORD INTERCEPTED: {masked}{RESET}")
+            pw = info['tankIDPass']
+            self.session['password'] = pw
+            masked = pw[:3] + '*' * max(0, len(pw) - 3) if pw else '(empty)'
+            print(f"  {RED}{BOLD}[!!!] PASSWORD: {masked}{RESET}")
+        
+        if 'token' in info or '_token' in info:
+            tok = info.get('token') or info.get('_token')
+            self.session['token'] = tok
         
         if 'world' in info:
             self.session['world'] = info['world']
-            print(f"  {GREEN}[WORLD] Entering: {info['world']}{RESET}")
+            print(f"  {GREEN}[WORLD] → {info['world']}{RESET}")
         
         if 'action' in info:
-            self.session['action'] = info['action']
-            self.stats['actions'] += 1
-    
-    def _log_packet(self, num: int, direction: str, size: int, info: dict[str, object], 
-                    dropped: bool, modified: bool, color: str):
-        """Log a packet to console."""
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            self.session['actions'].append(info['action'])
+            if 'enter_game' in info['action']:
+                print(f"  {GREEN}[GAME] Player entered world!{RESET}")
+            elif 'quit' in info['action'] or 'disconnect' in info['action']:
+                print(f"  {YELLOW}[GAME] Player left{RESET}")
         
-        flags = ""
-        if dropped:
-            flags += f" {RED}[DROP]{RESET}"
-        if modified:
-            flags += f" {YELLOW}[MOD]{RESET}"
-        
-        # Build summary
-        summary = ""
-        if 'action' in info:
-            summary = str(info['action'])
-        elif 'requestedName' in info:
-            pwd_masked = ""
-            if 'tankIDPass' in info:
-                pwd_masked = f", pass={str(info['tankIDPass'])[:3]}***"
-            summary = f"LOGIN: {info['requestedName']}{pwd_masked}"
-        elif 'enet' in info:
-            summary = str(info['enet'])
-        elif 'type' in info:
-            summary = str(info['type'])
-        elif 'world' in info:
-            summary = f"WORLD: {info.get('world', '?')}"
-        
-        if not summary and 'printable' in info:
-            text = str(info['printable'])
-            if any(c.isalpha() for c in text):
-                summary = text[:60]
-        
-        if not summary:
-            summary = f"{info['raw_size']}B binary"
-        
-        print(f"  [{ts}] {color}#{num:04d} {direction}{RESET} {size:>4}B {flags} {summary}")
-    
-    def _check_drop_rules(self, pkt_num: int, data: bytes) -> bool:
-        """Check if packet should be dropped."""
-        if not self.drop_rules:
-            return False
-        return pkt_num in self.drop_rules
-    
-    def _apply_modify_rules(self, pkt_num: int, data: bytes) -> bytes:
-        """Apply modification rules to packet."""
-        if pkt_num in self.modify_rules:
-            return self.modify_rules[pkt_num].encode()
-        return data
+        if info.get('has_players'):
+            fields = info.get('fields', {})
+            for k, v in fields.items():
+                if 'name' in k.lower() or 'player' in k.lower():
+                    self.session['players'].add(v)
     
     def _admin_loop(self):
         """Thread for user commands."""
@@ -326,89 +409,159 @@ class PiterInterceptor:
                 continue
             
             parts = cmd.split()
+            op = parts[0].lower()
             
-            if parts[0] == 'q':
+            if op == 'q':
                 self.running = False
-                print(f"  {YELLOW}[!] Shutting down...{RESET}")
                 self._cleanup()
                 break
             
-            elif parts[0] == 'd' and len(parts) == 2:
-                pkt_num = int(parts[1])
-                self.drop_rules.append(pkt_num)
-                print(f"  {RED}[DROP] Packet #{pkt_num} will be dropped{RESET}")
+            elif op == 's':
+                self._show_session()
             
-            elif parts[0] == 'm' and len(parts) >= 3:
-                pkt_num = int(parts[1])
-                new_data = ' '.join(parts[2:])
-                self.modify_rules[pkt_num] = new_data
-                print(f"  {YELLOW}[MOD] Packet #{pkt_num} will be modified{RESET}")
+            elif op == 'w':
+                self._show_world()
             
-            elif parts[0] == 'i':
-                data = ' '.join(parts[1:])
-                self.inject_queue.append(data.encode())
-                print(f"  {RED}[INJECT] Packet queued{RESET}")
+            elif op == 'd':
+                if len(parts) >= 2:
+                    try:
+                        n = int(parts[1])
+                        self.drop_rules.add(n)
+                        print(f"  {RED}[DROP] Packet #{n} will be dropped{RESET}")
+                    except:
+                        print(f"  {YELLOW}[?] Usage: d <packet_num>{RESET}")
+                else:
+                    print(f"  {YELLOW}[?] Usage: d <packet_num>{RESET}")
             
-            elif parts[0] == 's':
-                print(f"\n  {BOLD}Session Info:{RESET}")
-                for k, v in self.session.items():
-                    if k == 'password':
-                        v = v[:3] + '***' if v else ''
-                    print(f"    {k}: {v}")
-                print()
+            elif op == 'm':
+                if len(parts) >= 3:
+                    try:
+                        n = int(parts[1])
+                        text = ' '.join(parts[2:])
+                        self.modify_rules[n] = text
+                        print(f"  {MAGENTA}[MOD] Packet #{n} → \"{text[:60]}\"{RESET}")
+                    except:
+                        print(f"  {YELLOW}[?] Usage: m <packet_num> <new_text>{RESET}")
+                else:
+                    print(f"  {YELLOW}[?] Usage: m <packet_num> <new_text>{RESET}")
             
-            elif parts[0] == 'w':
-                print(f"\n  {BOLD}World Info:{RESET}")
-                print(f"    World: {self.session.get('world', 'unknown')}")
-                print(f"    Players seen: {len(self.session.get('players', set()))}")
-                print(f"    Actions: {self.stats.get('actions', 0)}")
-                print()
+            elif op == 'i':
+                if len(parts) >= 2:
+                    text = ' '.join(parts[1:])
+                    self.inject_queue.append(f"action|{text}\n")
+                    print(f"  {MAGENTA}[INJECT] Queued: action|{text}{RESET}")
+                else:
+                    print(f"  {YELLOW}[?] Usage: i <action_text>{RESET}")
             
-            elif parts[0] == 'stats':
+            elif op == 'x':
+                if len(parts) >= 2:
+                    text = ' '.join(parts[1:])
+                    self.inject_queue.append(f"{text}\n")
+                    print(f"  {MAGENTA}[INJECT] Queued raw: {text}{RESET}")
+                else:
+                    print(f"  {YELLOW}[?] Usage: x <raw_data>{RESET}")
+            
+            elif op == 'p':
+                if len(parts) >= 2:
+                    try:
+                        n = int(parts[1])
+                        if 0 <= n < len(self.stored_packets):
+                            data = self.stored_packets[n]
+                            self.inject_queue.append(data)
+                            print(f"  {MAGENTA}[REPLAY] Replaying packet #{n}{RESET}")
+                        else:
+                            print(f"  {YELLOW}[?] Packet #{n} not in buffer{RESET}")
+                    except:
+                        pass
+                else:
+                    print(f"  {YELLOW}[?] Usage: p <packet_num>{RESET}")
+            
+            elif op == 'stats':
                 print(f"\n  {BOLD}Proxy Stats:{RESET}")
                 print(f"    Packets: {self.packet_count}")
-                print(f"    Drops: {len(self.drop_rules)}")
-                print(f"    Modifications: {len(self.modify_rules)}")
-                print(f"    Injections: {len(self.inject_queue)}")
+                print(f"    Drops: {len(self.drop_rules)} pending")
+                print(f"    Mods: {len(self.modify_rules)} pending")
+                print(f"    Injections: {len(self.inject_queue)} queued")
+                print(f"    Session: {self.session['grow_id'] or '(waiting)'}")
+                print()
+            
+            elif op == 'h':
+                print(f"\n  {BOLD}Commands:{RESET}")
+                print(f"  s | w | stats | q")
+                print(f"  d <N>           — Drop packet N")
+                print(f"  m <N> <TEXT>    — Replace packet N with TEXT")
+                print(f"  i <ACTION>      — Inject action|ACTION")
+                print(f"  x <RAW>         — Inject raw data")
+                print(f"  p <N>           — Replay saved packet N")
                 print()
             
             else:
-                print(f"  {YELLOW}[?] Unknown command. Try: s, w, stats, q{RESET}")
+                print(f"  {YELLOW}[?] Unknown. Type 'h' for help.{RESET}")
+    
+    def _show_session(self):
+        print(f"\n  {BOLD}{'═'*40}{RESET}")
+        print(f"  {BOLD}  Session Info{RESET}")
+        print(f"  {'═'*40}")
+        for k, v in self.session.items():
+            if k == 'password' and v:
+                v = v[:3] + '*' * max(0, len(v) - 3)
+            elif k == 'actions':
+                v = v[-5:] if v else '[]'
+            elif k == 'players':
+                v = list(v)[:10]
+            print(f"  {k:>15}: {v}")
+        print()
+    
+    def _show_world(self):
+        players = self.session.get('players', set())
+        print(f"\n  {BOLD}{'═'*40}{RESET}")
+        print(f"  {BOLD}  World Info{RESET}")
+        print(f"  {'═'*40}")
+        print(f"  World:     {self.session.get('world', 'unknown')}")
+        print(f"  Players:   {len(players)}")
+        if players:
+            for i, p in enumerate(list(players)[:20], 1):
+                print(f"    {i}. {p}")
+        print(f"  Actions:   {len(self.session.get('actions', []))}")
+        if self.session['actions']:
+            for a in self.session['actions'][-10:]:
+                print(f"    → {a}")
+        print()
     
     def _cleanup(self):
-        """Clean shutdown."""
-        print(f"\n  {CYAN}[DONE] {self.packet_count} packets intercepted{RESET}")
-        print(f"  {CYAN}[PF] Disable: sudo pfctl -d{RESET}")
+        print(f"\n  {CYAN}{'═'*40}{RESET}")
+        print(f"  {CYAN}  Session Summary{RESET}")
+        print(f"  {CYAN}{'═'*40}{RESET}")
+        print(f"  Packets:   {self.packet_count}")
+        print(f"  GrowID:    {self.session['grow_id'] or '(none)'}")
+        print(f"  World:     {self.session['world'] or '(none)'}")
+        print(f"  Players:   {len(self.session['players'])}")
+        print(f"  Actions:   {len(self.session['actions'])}")
+        print()
         self.running = False
 
 
-def setup_pf():
-    """Print pf setup instructions."""
-    print(f"""
-{YELLOW}=== macOS Packet Filter Setup ==={RESET}
-
-One-time setup:
-    sudo pfctl -e
-
-Redirect rule (run before starting interceptor):
-    echo "rdr pass on en0 proto udp from any to any port 17091 -> 127.0.0.1 port {PROXY_PORT}" | sudo pfctl -f -
-
-Or for active interface:
-    echo "rdr pass proto udp from any to any port 17091 -> 127.0.0.1 port {PROXY_PORT}" | sudo pfctl -f -
-
-Check:
-    sudo pfctl -s nat
-
-Disable:
-    sudo pfctl -d
-""")
+def detect_interface():
+    """Auto-detect active network interface on macOS."""
+    try:
+        out = subprocess.check_output(['route', '-n', 'get', 'default'], 
+                                       stderr=subprocess.DEVNULL, timeout=3).decode()
+        for line in out.split('\n'):
+            m = re.search(r'interface:\s+(\S+)', line)
+            if m:
+                return m.group(1)
+    except:
+        pass
+    return 'en0'
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "setup":
-            setup_pf()
-            sys.exit(0)
+    mode = sys.argv[1] if len(sys.argv) > 1 else 'local'
     
-    interceptor = PiterInterceptor()
+    if mode == 'local':
+        # Auto-detect interface and show /etc/hosts instruction
+        iface = detect_interface()
+        print(f"\n  {YELLOW}Detected interface:{RESET} {iface}")
+        
+    interceptor = PiterInterceptor(mode=mode)
     interceptor.start()
