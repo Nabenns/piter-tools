@@ -1,33 +1,26 @@
 #!/usr/bin/env python3
 """
-Piter Hook — Direct Memory Scanner for Growtopia
-=================================================
-Attaches to Growtopia process (PID you specify) and scans
-all readable memory regions for GrowID, password, token, world, etc.
+Piter Hook v2 — macOS Memory Scanner for Growtopia
+===================================================
+Directly attach to Growtopia process and dump readable strings,
+memory maps, and search for credentials.
+Uses mach_vm_* APIs (needs SIP debug exemption).
 
-USAGE:
-  python3 piter_hook.py                    # Auto-find GT process
-  python3 piter_hook.py <PID>              # Specific PID
-  python3 piter_hook.py scan               # Just list candidates
-  python3 piter_hook.py dump > out.txt     # Dump all found strings
-
-More reliable than MITM — reads actual memory, can't be bypassed.
+Pure Python + ctypes, no external deps.
 """
 
-import sys
-import os
-import re
-import struct
 import ctypes
 import ctypes.util
-from ctypes import (
-    c_int, c_uint, c_uint32, c_uint64, c_void_p, c_char_p,
-    c_size_t, c_bool, Structure, POINTER, byref, sizeof
-)
-from datetime import datetime
+import sys
+import struct
+import os
+import re
+from typing import Optional
 
+# ──── Mach / Darwin Constants ────
+libc = ctypes.CDLL(ctypes.util.find_library('c'))
+libkern = ctypes.CDLL(ctypes.util.find_library('System'))
 
-# ──── Mach VM Constants ────
 VM_PROT_READ = 0x01
 VM_PROT_WRITE = 0x02
 VM_PROT_EXECUTE = 0x04
@@ -35,315 +28,334 @@ VM_PROT_EXECUTE = 0x04
 MACH_PORT_NULL = 0
 MACH_MSG_TYPE_COPY_SEND = 19
 
-# task_for_pid constants
-TASK_FOR_PID = 0x002
+# ──── Data types ────
+mach_port_t = ctypes.c_uint32
+vm_address_t = ctypes.c_ulonglong
+vm_size_t = ctypes.c_ulonglong
+vm_offset_t = ctypes.c_ulonglong
+natural_t = ctypes.c_uint32
+kern_return_t = ctypes.c_int
+boolean_t = ctypes.c_uint
+thread_act_t = ctypes.c_uint32
 
 
-class vm_region_basic_info_data_64_t(Structure):
-    """Mach VM region info."""
+class task_basic_info(ctypes.Structure):
     _fields_ = [
-        ("protection", c_uint32),
-        ("max_protection", c_uint32),
-        ("inheritance", c_uint32),
-        ("shared", c_uint32),
-        ("reserved", c_uint32),
-        ("offset", c_uint64),
-        ("behavior", c_uint32),
-        ("user_wired_count", c_uint32),
+        ("suspend_count", ctypes.c_uint32),
+        ("virtual_size", ctypes.c_ulonglong),
+        ("resident_size", ctypes.c_ulonglong),
+        ("user_time_sec", ctypes.c_uint32),
+        ("user_time_usec", ctypes.c_uint32),
+        ("system_time_sec", ctypes.c_uint32),
+        ("system_time_usec", ctypes.c_uint32),
+        ("policy", ctypes.c_uint32),
     ]
 
 
-# ──── Mach API Bindings ────
-libc = ctypes.CDLL(ctypes.util.find_library("c"))
+# ──── Libc / Mach API Setup ────
+TASK_FOR_PID_FN = libc.task_for_pid
+TASK_FOR_PID_FN.argtypes = [mach_port_t, ctypes.c_int, ctypes.POINTER(mach_port_t)]
+TASK_FOR_PID_FN.restype = kern_return_t
 
-# Mach kernel interface
-try:
-    mach = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-except:
-    mach = libc
-
-mach.mach_task_self.restype = c_uint32
-mach.mach_task_self.argtypes = []
-
-mach.task_for_pid.restype = c_int
-mach.task_for_pid.argtypes = [c_uint32, c_int, POINTER(c_uint32)]
-
-mach.mach_vm_region.restype = c_int
-mach.mach_vm_region.argtypes = [
-    c_uint32, POINTER(c_uint64), POINTER(c_uint64),
-    c_int, POINTER(vm_region_basic_info_data_64_t),
-    POINTER(c_uint32), POINTER(c_uint32)
+MACH_VM_REGION = libkern.mach_vm_region
+MACH_VM_REGION.argtypes = [
+    mach_port_t, ctypes.POINTER(vm_address_t), ctypes.POINTER(vm_size_t),
+    natural_t, ctypes.POINTER(ctypes.c_uint32), ctypes.c_int,
+    ctypes.POINTER(ctypes.c_char * 256)
 ]
+MACH_VM_REGION.restype = kern_return_t
 
-mach.mach_vm_read_overwrite.restype = c_int
-mach.mach_vm_read_overwrite.argtypes = [
-    c_uint32, c_uint64, c_uint64,
-    c_void_p, POINTER(c_uint64)
+MACH_VM_READ = libkern.mach_vm_read_overwrite
+MACH_VM_READ.argtypes = [
+    mach_port_t, vm_address_t, vm_size_t,
+    vm_address_t, ctypes.POINTER(vm_size_t)
 ]
+MACH_VM_READ.restype = kern_return_t
 
-mach.vm_deallocate.restype = c_int
-mach.vm_deallocate.argtypes = [c_uint32, c_void_p, c_size_t]
+MACH_VM_DEALLOCATE = libkern.mach_vm_deallocate
+MACH_VM_DEALLOCATE.argtypes = [mach_port_t, vm_address_t, vm_size_t]
+MACH_VM_DEALLOCATE.restype = kern_return_t
 
-
-TARGET_PROCESS = "Growtopia"
-
-# Patterns to search for
-PATTERNS = {
-    "grow_id": [
-        rb'tankIDName\x00([^\x00]{1,64})',
-        rb'growId\x00([^\x00]{1,64})',
-        rb'"growId"\s*:\s*"([^"]+)"',
-    ],
-    "password": [
-        rb'tankIDPass\x00([^\x00]{1,64})',
-        rb'password\x00([^\x00]{1,64})',
-        rb'"password"\s*:\s*"([^"]+)"',
-    ],
-    "token": [
-        rb'_token\x00([^\x00]{1,256})',
-        rb'"token"\s*:\s*"([^"]+)"',
-    ],
-    "world": [
-        rb'world\x00([^\x00]{1,64})',
-        rb'currentWorld\x00([^\x00]{1,64})',
-    ],
-}
+MACH_TASK_BASIC_INFO_COUNT = ctypes.sizeof(task_basic_info) // ctypes.sizeof(natural_t)
+MACH_TASK_BASIC_INFO = libc.task_info
+MACH_TASK_BASIC_INFO.argtypes = [mach_port_t, natural_t, ctypes.c_void_p, ctypes.POINTER(natural_t)]
+MACH_TASK_BASIC_INFO.restype = kern_return_t
 
 
-def find_growtopia_pid():
-    """Find Growtopia process PID."""
-    try:
-        out = os.popen("ps aux | grep -i Growtopia | grep -v grep").read()
-        lines = out.strip().split('\n')
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 2:
-                pid = int(parts[1])
-                name = parts[-1] if len(parts) > 10 else ''
-                if 'Growtopia' in name or 'Growtopia' in line:
-                    return pid
-    except:
-        pass
-    return None
-
-
-def task_for_pid(target_pid):
-    """Get task port for PID."""
-    task = c_uint32(0)
-    ret = mach.task_for_pid(mach.mach_task_self(), target_pid, byref(task))
+def task_for_pid(target_pid: int) -> Optional[int]:
+    """Get task port for a given PID."""
+    task = mach_port_t(0)
+    ret = TASK_FOR_PID_FN(mach_port_t(MACH_PORT_NULL), target_pid, ctypes.byref(task))
     if ret != 0:
         return None
     return task.value
 
 
-def scan_region(task, addr, size):
-    """Read and scan a memory region, return found matches."""
-    if size == 0 or size > 256 * 1024 * 1024:
-        return []
+def get_task_info(task: int) -> Optional[task_basic_info]:
+    """Get basic task info (memory size, etc)."""
+    info = task_basic_info()
+    count = natural_t(MACH_TASK_BASIC_INFO_COUNT)
+    ret = MACH_TASK_BASIC_INFO(task, 20, ctypes.byref(info), ctypes.byref(count))
+    if ret != 0:
+        return None
+    return info
+
+
+def read_memory(task: int, address: int, size: int) -> Optional[bytes]:
+    """Read raw memory from task at address."""
+    if size == 0:
+        return b""
     
-    data = (ctypes.c_char * size)()
-    data_out = c_uint64(0)
+    buf = ctypes.create_string_buffer(size)
+    out_size = vm_size_t(0)
     
-    ret = mach.mach_vm_read_overwrite(
-        task, addr, size,
-        ctypes.cast(data, c_void_p), byref(data_out)
+    ret = MACH_VM_READ(task, address, size,
+                       ctypes.cast(buf, vm_address_t),
+                       ctypes.byref(out_size))
+    
+    if ret != 0:
+        return None
+    
+    return buf.raw[:out_size.value]
+
+
+# ──── String Scanner ────
+def is_ascii_printable(data: bytes) -> bool:
+    """Check if data is mostly printable ASCII."""
+    printable = sum(1 for b in data if 0x20 <= b < 0x7F)
+    return printable > len(data) * 0.7
+
+
+def scan_region(task: int, address: int, size: int,
+                search_terms: list[bytes] = None) -> list[dict]:
+    """Scan a memory region for interesting strings.
+    
+    Returns list of {offset, length, data}
+    """
+    CHUNK = 0x10000  # 64KB chunks
+    
+    results = []
+    full_data = b""
+    
+    # Read the region in chunks
+    for offset in range(0, min(size, 50 * 1024 * 1024), CHUNK):  # Max 50MB
+        chunk = min(CHUNK, size - offset)
+        data = read_memory(task, address + offset, chunk)
+        if data:
+            full_data += data
+    
+    if not full_data:
+        return results
+    
+    # Find printable strings (min 4 chars)
+    current = b""
+    start_offset = 0
+    
+    for i, byte in enumerate(full_data):
+        if 0x20 <= byte < 0x7F or byte in (0x09, 0x0A, 0x0D):  # tab, lf, cr
+            if not current:
+                start_offset = i
+            current += bytes([byte])
+        else:
+            if len(current) >= 4:
+                text = current.decode('ascii', errors='replace')
+                results.append({
+                    'offset': address + start_offset,
+                    'length': len(current),
+                    'data': text,
+                })
+            current = b""
+    
+    # Don't forget the last string
+    if len(current) >= 4:
+        text = current.decode('ascii', errors='replace')
+        results.append({
+            'offset': address + start_offset,
+            'length': len(current),
+            'data': text,
+        })
+    
+    return results
+
+
+def find_growid_credentials(strings: list[dict]) -> list[dict]:
+    """Find GrowID-related strings from scanned data."""
+    findings = []
+    
+    for s in strings:
+        text = s['data']
+        
+        # Match GrowID patterns
+        for pattern, label in [
+            (r'requestedName\|(\w+)', 'requestedName'),
+            (r'tankIDName\|(\w+)', 'tankIDName'),
+            (r'tankIDPass\|(\w+)', 'tankIDPass'),
+            (r'growId=(\w+)', 'growId'),
+            (r'password=(\w+)', 'password'),
+            (r'_token=(\d+)', 'token'),
+            (r'token=([\w/=+]+)', 'token'),
+            (r'prod=(\w+)', 'product'),
+            (r'world\|(\w+)', 'world'),
+            (r'onSuperMainStart', 'GAME_START'),
+            (r'onSendToServer\|', 'GAME_ACTION'),
+        ]:
+            match = re.search(pattern, text.encode('ascii', errors='replace') if isinstance(text, str) else text)
+            if match:
+                findings.append({
+                    'offset': s['offset'],
+                    'label': label,
+                    'value': match.group(1) if match.lastindex else 'TRIGGER',
+                    'context': text[:100],
+                })
+    
+    return findings
+
+
+def find_domains_urls(strings: list[dict]) -> list[dict]:
+    """Find URLs and domains in scanned strings."""
+    findings = []
+    url_pattern = re.compile(
+        r'(https?://[\w.-]+(?:\.\w+)+(?:/\S*)?)'
+        r'|([\w-]+\.(?:com|net|org|id|io|app|gg|xyz|my|id|tk|ml|ga|cf|gq))',
+        re.IGNORECASE
     )
     
-    if ret != 0 or data_out.value == 0:
-        return []
+    for s in strings:
+        matches = url_pattern.findall(s['data'])
+        for match in matches:
+            url = match[0] or match[1] or match[2]
+            if url and len(url) > 4:
+                findings.append({
+                    'offset': s['offset'],
+                    'url': url,
+                    'context': s['data'][:100],
+                })
     
-    raw = bytes(data[:data_out.value])
-    results = []
-    
-    for category, regexes in PATTERNS.items():
-        for regex in regexes:
-            for match in re.finditer(regex, raw):
-                value = match.group(1)
-                try:
-                    text = value.decode('utf-8', errors='replace')
-                    if text.isprintable() and len(text) > 1:
-                        results.append((category, text, addr + match.start(1)))
-                except:
-                    pass
-    
-    return results
+    return findings
 
 
-def scan_memory(task):
-    """Scan all readable memory regions."""
-    results = []
-    address = c_uint64(0)
-    size = c_uint64(0)
-    info = vm_region_basic_info_data_64_t()
-    info_count = c_uint32(sizeof(info) // 4)
-    object_name = c_uint32(0)
-    
-    region_count = 0
-    
-    print("  Scanning memory regions...")
-    
-    while True:
-        ret = mach.mach_vm_region(
-            task, byref(address), byref(size),
-            0, byref(info), byref(info_count), byref(object_name)
-        )
+# ──── Main ────
+def main():
+    if len(sys.argv) < 2:
+        print("[*] Usage: sudo python3 piter_hook.py <PID>")
+        print("[*] Find PID: ps aux | grep Growtopia")
         
-        if ret != 0:
-            break
-        
-        region_count += 1
-        
-        # Only scan readable regions, skip execute-only
-        if info.protection & VM_PROT_READ and not (info.protection & VM_PROT_EXECUTE):
-            if 0 < size.value <= 256 * 1024 * 1024:
-                found = scan_region(task, address.value, size.value)
-                if found:
-                    results.extend(found)
-        
-        address = c_uint64(address.value + size.value)
-        
-        if address.value == 0 or size.value == 0:
-            break
-    
-    print(f"  Scanned {region_count} regions")
-    return results
-
-
-def auto_mode():
-    """Auto-find GT process and scan."""
-    pid = find_growtopia_pid()
-    
-    if pid is None:
-        print("[!] Growtopia not running.")
-        print("[!] Start Growtopia first, login, then run this.")
-        
-        # Fallback: let user specify
-        print("\n[*] Looking for Growtopia in ps output...")
-        os.system("ps aux | grep -i growto | grep -v grep || true")
-        print()
-        pid_str = input("[?] Enter PID manually: ").strip()
+        # Auto-detect
+        import subprocess
         try:
-            pid = int(pid_str)
+            out = subprocess.check_output(
+                "ps aux | grep -i [g]rowtopia | awk '{print $2}'",
+                shell=True, stderr=subprocess.DEVNULL
+            ).decode().strip()
+            if out:
+                pid = int(out.split()[0])
+                print(f"[*] Auto-detected Growtopia PID: {pid}")
+            else:
+                print("[!] Growtopia not found. Start Growtopia first and login.")
+                sys.exit(1)
         except:
-            print("[!] Invalid PID.")
+            print("[!] Growtopia not found. Start Growtopia first and login.")
             sys.exit(1)
+    else:
+        pid = int(sys.argv[1])
     
     print(f"\n[*] Attaching to Growtopia (PID: {pid})...")
     
     task = task_for_pid(pid)
     if task is None:
-        print("\n[!] Cannot access Growtopia memory.")
-        print("\n  Reason: System Integrity Protection (SIP) is ON.")
-        print("\n  Fix: Disable SIP debug restrictions")
-        print("    1. Reboot → hold Cmd+R (Recovery)")
-        print("    2. Utilities → Terminal")
-        print("    3. csrutil enable --without debug")
-        print("    4. Reboot")
-        print("    5. Run this script again")
-        print("\n  Or use the MITM interceptor instead:")
-        print("    sudo python3 piter_intercept.py")
+        print("[!] task_for_pid failed. SIP might be blocking debug access.")
+        print("[!] Fix: boot into Recovery (Cmd+R), run 'csrutil enable --without debug', reboot.")
+        print("[!] Or use piter_intercept.py instead (no SIP needed).")
         sys.exit(1)
     
     print(f"  Task port: {task}")
-    print(f"  Scanning memory...")
-    print()
     
-    results = scan_memory(task)
+    info = get_task_info(task)
+    if info:
+        print(f"  Virtual size: {info.virtual_size / 1024 / 1024:.0f} MB")
+        print(f"  Resident size: {info.resident_size / 1024 / 1024:.0f} MB")
     
-    if not results:
-        print("\n  [-] No matches found in memory.")
-        print("  [*] Ensure you're logged in to the server.")
-        print("  [*] The GrowID/password should be in memory during gameplay.")
+    print(f"\n  Scanning memory...")
+    
+    # Scan all readable memory regions
+    address = vm_address_t(0)
+    size = vm_size_t(0)
+    region_count = 0
+    
+    all_strings = []
+    
+    MAX_REGIONS = 5000
+    MAX_TOTAL = 2 * 1024 * 1024 * 1024  # 2GB max
+    
+    while region_count < MAX_REGIONS and address.value < MAX_TOTAL:
+        addr_before = address.value
+        info_count = ctypes.c_uint32(0)
+        object_name = ctypes.create_string_buffer(256)
+        
+        ret = MACH_VM_REGION(task, ctypes.byref(address), ctypes.byref(size),
+                            1, ctypes.byref(info_count), 0,
+                            object_name)
+        
+        if ret != 0:
+            break
+        
+        # Only scan readable regions
+        if (info_count.value & VM_PROT_READ) and size.value > 0:
+            region_count += 1
+            
+            # Skip tiny regions
+            if size.value < 128:
+                address.value += size.value
+                continue
+            
+            # Read and scan
+            strings = scan_region(task, address.value, min(size.value, 10 * 1024 * 1024))
+            
+            if strings:
+                all_strings.extend(strings)
+            
+            if region_count % 200 == 0:
+                print(f"  Scanned {region_count} regions, {len(all_strings)} strings found...", end='\r')
+        
+        address.value += size.value
+    
+    print(f"\n  Scanned {region_count} regions")
+    print(f"  Found {len(all_strings)} readable strings\n")
+    
+    if not all_strings:
+        print("  [-] No strings found. Possible causes:")
+        print("      - Growtopia needs to be logged in to the server")
+        print("      - SIP might still be blocking reads (test: sudo csrutil status)")
+        print("      - Memory might be encrypted/protected")
         return
     
-    print(f"\n  [RESULT] Found {len(results)} matches:")
-    print(f"  {'─'*50}")
+    # Search for credentials
+    creds = find_growid_credentials(all_strings)
     
-    # Deduplicate and organize
-    seen = set()
-    organized = {"grow_id": [], "password": [], "token": [], "world": []}
+    if creds:
+        print(f"  [!!!] FOUND {len(creds)} GTPS-related strings:\n")
+        for c in creds:
+            print(f"    [{c['label']}] {c['value']}")
+            print(f"      offset: 0x{c['offset']:x}")
+            print(f"      context: {c['context']}")
+            print()
+    else:
+        print("  [-] No GTPS credentials found in memory.")
+        print("  [*] Try different search patterns:")
     
-    for category, value, addr in results:
-        key = (category, value)
-        if key not in seen:
-            seen.add(key)
-            organized[category].append((value, addr))
+    # Search for URLs
+    urls = find_domains_urls(all_strings)
+    if urls:
+        print(f"\n  [*] Found {len(urls)} URLs/domains:")
+        for u in urls[:10]:
+            print(f"    {u['url']}")
     
-    for cat, items in organized.items():
-        if items:
-            print(f"\n  [{cat.upper()}]")
-            for value, addr in items:
-                # Mask passwords partially
-                if cat == "password":
-                    masked = value[:2] + '*' * max(0, len(value) - 2)
-                    print(f"    0x{addr:016x} → {masked}")
-                else:
-                    print(f"    0x{addr:016x} → {value}")
-    
-    # Summary
-    print(f"\n  [SUMMARY]")
-    for cat in ["grow_id", "password", "token", "world"]:
-        if organized[cat]:
-            val = organized[cat][0][0]
-            if cat == "password":
-                val = val[:2] + '*' * max(0, len(val) - 2)
-            print(f"    {cat}: {val}")
-
-
-def scan_mode():
-    """Just list candidate processes."""
-    print("\n[*] Looking for Growtopia processes...")
-    os.system("ps aux | grep -i grow | grep -v grep || echo '  No GT process found'")
-    
-    print("\n[*] Looking for any Mach-O GUI apps...")
-    os.system("ps aux | grep -E 'MacOS/' | head -20 || echo '  None'")
-    
-    print("\n[*] To scan a specific PID:")
-    print("  python3 piter_hook.py <PID>")
-
-
-def dump_mode():
-    """Dump all found strings from memory (for piping to file)."""
-    pid = find_growtopia_pid()
-    if pid is None:
-        print("[!] Growtopia not running.")
-        sys.exit(1)
-    
-    task = task_for_pid(pid)
-    if task is None:
-        print("[!] Cannot access memory (SIP enabled).")
-        sys.exit(1)
-    
-    results = scan_memory(task)
-    
-    seen = set()
-    for category, value, addr in results:
-        key = (category, value)
-        if key not in seen:
-            seen.add(key)
-            print(f"{category}\t0x{addr:016x}\t{value}")
+    # Show some random strings for debugging
+    print(f"\n  [*] Sample readable strings ({min(20, len(all_strings))} of {len(all_strings)}):")
+    for s in all_strings[:20]:
+        text = s['data'][:80].replace('\n', '\\n').replace('\t', '\\t')
+        print(f"    0x{s['offset']:x}: {text}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].lower()
-        if arg == "scan":
-            scan_mode()
-        elif arg == "dump":
-            dump_mode()
-        else:
-            try:
-                pid = int(arg)
-                print(f"[*] Attaching to PID: {pid}")
-                task = task_for_pid(pid)
-                if task is None:
-                    print("[!] Cannot access memory.")
-                    sys.exit(1)
-                results = scan_memory(task)
-                for category, value, addr in results:
-                    print(f"{category}\t0x{addr:016x}\t{value}")
-            except ValueError:
-                print(f"[!] Unknown argument: {arg}")
-                print("Usage: piter_hook.py [scan|dump|<PID>]")
-    else:
-        auto_mode()
+    main()
