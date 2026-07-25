@@ -80,3 +80,35 @@ Real auth happens in the ENet game server which reads player files from disk.
 ## Disclaimer
 
 Educational / authorized pentesting only. Don't be a dick.
+
+---
+
+## Phase 1: Piter Cheat Engine (Frida)
+
+Memory hook ke Growtopia via Frida. Intercept semua packet, baca memory,
+inject command — langsung dari terminal.
+
+### Requirements
+```bash
+pip3 install frida-tools
+```
+
+### Usage
+```bash
+# Start Growtopia and login first
+# Then:
+python3 piter_cheat.py
+
+# Or attach to specific PID:
+python3 piter_cheat.py --pid 22782
+```
+
+### Commands
+```
+/state        Show player state (growID, world, gems)
+/packets [N]  Show last N packets (default: 10)
+/scan <str>   Scan memory for string
+/watch        Continuous packet monitor
+/hook         Hook status
+/quit         Exit
+```
