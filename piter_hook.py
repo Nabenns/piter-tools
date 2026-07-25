@@ -37,7 +37,7 @@ import signal
 import re
 import time
 from ctypes import (
-    c_uint32, c_uint64, c_int, c_void_p, c_char_p, c_size_t,
+    c_uint16, c_uint32, c_uint64, c_int, c_void_p, c_char_p, c_size_t,
     byref, POINTER, Structure, addressof, cast, string_at
 )
 from typing import Optional
