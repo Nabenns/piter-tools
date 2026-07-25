@@ -1,386 +1,248 @@
 #!/usr/bin/env python3
 """
-Piter Cheat Engine — Frida Controller (Phase 1)
-=================================================
-Attaches to Growtopia process via Frida, injects piter_agent.js.
-Provides CLI dashboard with live packet monitoring and command interface.
+Piter Cheat Engine — Frida-based Growtopia Hook
+================================================
+Phase 1: Hook ENet send/recv, capture GrowID, password, tokens.
+Works on Mac (Frida v7+).
 
-USAGE:
-  python3 piter_cheat.py              # Auto-attach to Growtopia
-  python3 piter_cheat.py --pid 1234   # Attach to specific PID
-  
-REQUIRES: pip3 install frida-tools
+Usage:
+  pip3 install frida-tools
+  python3 piter_cheat.py          # auto-attach to Growtopia
+  python3 piter_cheat.py --debug  # verbose mode
 
-COMMANDS (in-app):
-  /help        Show commands
-  /state       Show player state (growID, world, gems)
-  /packets     Show recent packets
-  /scan <str>  Scan memory for string
-  /watch       Continuous packet monitor (Ctrl+C to exit)
-  /hook        Hook status
-  /quit        Exit
+Requirements:
+  - Growtopia running (logged in)
+  - Frida installed
+  - Root/sudo (for task_for_pid)
 """
 
-import frida
 import sys
 import time
+import frida
+import subprocess
 import json
-import threading
-import os
 from datetime import datetime
 
-# ──── Colors ────
-class C:
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
-    CYAN = '\033[96m'
-    WHITE = '\033[97m'
-    BOLD = '\033[1m'
-    DIM = '\033[2m'
-    RESET = '\033[0m'
 
-BANNER = f"""
-{C.MAGENTA}{C.BOLD}╔══════════════════════════════════════════╗
-║     PITER CHEAT ENGINE — Phase 1         ║
-║     Frida-based Growtopia Hook            ║
-╚══════════════════════════════════════════╝{C.RESET}
-"""
-
-AGENT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'piter_agent.js')
-
-# ──── Frida Controller ────
+# ──── Cheat Engine ────
 class PiterCheat:
-    def __init__(self, pid=None):
-        self.pid = pid
+    def __init__(self, debug=False):
+        self.debug = debug
         self.session = None
         self.script = None
-        self.running = False
-        self.state = {}
         self.packets = []
-        
-    def attach(self):
-        """Attach to Growtopia process."""
-        if self.pid:
-            try:
-                self.session = frida.attach(self.pid)
-                print(f"{C.GREEN}[*] Attached to PID {self.pid}{C.RESET}")
-            except frida.ProcessNotFoundError:
-                print(f"{C.RED}[!] PID {self.pid} not found{C.RESET}")
-                sys.exit(1)
-        else:
-            # Auto-find Growtopia
-            try:
-                device = frida.get_local_device()
-                processes = device.enumerate_processes()
-                
-                gt_procs = [p for p in processes if 'growtopia' in p.name.lower()]
-                
-                if not gt_procs:
-                    print(f"{C.RED}[!] Growtopia not running. Start it first.{C.RESET}")
-                    sys.exit(1)
-                
-                if len(gt_procs) == 1:
-                    self.pid = gt_procs[0].pid
-                else:
-                    # Multiple — use the one with highest memory
-                    gt_procs.sort(key=lambda x: x.parameters.get('rss', 0), reverse=True)
-                    self.pid = gt_procs[0].pid
-                    print(f"{C.YELLOW}[*] Multiple GT processes, using PID {self.pid} (largest){C.RESET}")
-                
-                self.session = frida.attach(self.pid)
-                print(f"{C.GREEN}[*] Attached to Growtopia (PID: {self.pid}){C.RESET}")
-            except Exception as e:
-                print(f"{C.RED}[!] Failed: {e}{C.RESET}")
-                print(f"{C.YELLOW}[*] Try: python3 piter_cheat.py --pid <PID>{C.RESET}")
-                sys.exit(1)
-        
-        return True
-    
-    def load_agent(self):
-        """Load and inject the Frida agent script."""
-        if not os.path.exists(AGENT_PATH):
-            print(f"{C.RED}[!] Agent not found: {AGENT_PATH}{C.RESET}")
-            return False
-        
-        with open(AGENT_PATH) as f:
-            source = f.read()
-        
-        self.script = self.session.create_script(source)
-        
-        # Message handler
-        self.script.on('message', self._on_message)
-        self.script.load()
-        
-        print(f"{C.GREEN}[+] Agent injected. Waiting for hooks...{C.RESET}")
-        return True
-    
-    def _on_message(self, message, data):
+        self.exfiltrated = []
+        self.player_info = {
+            'grow_id': '',
+            'password': '',
+            'token': '',
+            'uid': '',
+            'world': '',
+            'net_id': 0
+        }
+        self.packet_count = 0
+        self.start_time = time.time()
+
+    def find_growtopia(self):
+        """Find the Growtopia process PID."""
+        try:
+            result = subprocess.run(
+                ['pgrep', '-fl', 'Growtopia'],
+                capture_output=True, text=True
+            )
+            lines = [l for l in result.stdout.strip().split('\n') if l]
+            if not lines:
+                return None
+
+            # Filter: prefer the main process (largest PID usually)
+            pids = []
+            for line in lines:
+                parts = line.split()
+                pid = int(parts[0])
+                name = ' '.join(parts[1:])
+                pids.append((pid, name))
+            
+            if len(pids) > 1:
+                pids.sort(key=lambda x: x[0], reverse=True)
+                if self.debug:
+                    print(f"[*] Multiple GT processes, using PID {pids[0][0]} (largest)")
+            
+            return pids[0][0]
+        except Exception as e:
+            print(f"[!] Can't find Growtopia: {e}")
+            return None
+
+    def exfiltrate(self, data):
+        """Log exfiltrated data for dashboard."""
+        self.exfiltrated.append(data)
+        if 'grow_id' in data and not self.player_info['grow_id']:
+            self.player_info['grow_id'] = data['grow_id']
+        if 'password' in data and not self.player_info['password']:
+            self.player_info['password'] = data['password']
+        if 'token' in data:
+            self.player_info['token'] = data['token']
+        if 'world' in data:
+            self.player_info['world'] = data['world']
+
+    def print_dashboard(self):
+        """Show live dashboard."""
+        elapsed = int(time.time() - self.start_time)
+        print(f"\n  PITER CHEAT — {elapsed}s | packets: {self.packet_count}")
+        if self.player_info['grow_id']:
+            print(f"  GrowID: {self.player_info['grow_id']}")
+        if self.player_info['password']:
+            print(f"  Password: {self.player_info['password']}")
+        if self.player_info['world']:
+            print(f"  World: {self.player_info['world']}")
+        print()
+
+    def on_message(self, message, data):
         """Handle messages from Frida agent."""
-        if message['type'] == 'error':
-            print(f"{C.RED}[!] Agent error: {message.get('description', message)}{C.RESET}")
-            return
-        
         if message['type'] == 'send':
             payload = message.get('payload', {})
-            event = payload.get('event', '')
-            
-            if event == 'ready':
-                ok = payload.get('hooksOk', False)
-                status = f"{C.GREEN}OK{C.RESET}" if ok else f"{C.RED}FAILED{C.RESET}"
-                print(f"{C.GREEN}[+] Agent ready. Hooks: {status}{C.RESET}")
-                if ok:
-                    print(f"{C.GREEN}[+] All hooks active — monitoring packets...{C.RESET}")
-            
-            elif event == 'packet_out':
-                ptype = payload.get('type', '?')
-                summary = payload.get('summary', '')
+            msg_type = payload.get('type', 'unknown')
+
+            if msg_type == 'loaded':
+                print(f"[!] Piter Frida Agent v8 loaded")
+                if 'pid' in payload:
+                    print(f"[*] Target PID: {payload['pid']}, arch: {payload.get('arch', '?')}")
+
+            elif msg_type == 'ready' or msg_type == 'debug':
+                if msg_type == 'ready':
+                    results = payload.get('results', {})
+                    
+                    if self.debug and 'modules' in results:
+                        print(f"\n  [DEBUG] System modules:")
+                        for m in results['modules']:
+                            print(f"    {m['name']}: {m['path']}")
+
+                    if self.debug and 'hooks' in results:
+                        print(f"\n  [DEBUG] Hook attempts:")
+                        for name, info in results['hooks'].items():
+                            if isinstance(info, dict):
+                                status = 'OK' if info.get('ok') else f"FAIL ({info.get('flag', '?')})"
+                            else:
+                                status = 'OK' if info else 'FAIL'
+                            print(f"    {name}: {status}")
+
+                    send_ok = payload.get('sendHooked', False)
+                    recv_ok = payload.get('recvHooked', False)
+                    status = f"send: {'OK' if send_ok else 'FAIL'}, recv: {'OK' if recv_ok else 'FAIL'}"
+                    print(f"\n[+] Agent ready. Hooks: {status}")
+
+                elif msg_type == 'debug' and self.debug:
+                    print(f"  [DEBUG] {payload.get('msg', '')}")
+
+            elif msg_type == 'connected':
+                fd = payload.get('fd')
+                port = payload.get('port')
+                print(f"[+] Socket detected: fd={fd}, port={port}")
+
+            elif msg_type == 'packet':
+                self.packet_count += 1
+                dir_ = payload.get('dir', '?')
                 size = payload.get('size', 0)
+                info = payload.get('info', '')
+                hex_ = payload.get('hex', '')
+                fields = payload.get('fields', {})
+
+                # Color and print
+                color = '\033[92m' if dir_ == '→' else '\033[94m'
+                reset = '\033[0m'
+                ts = datetime.now().strftime("%H:%M:%S")
                 
-                # Color by type
-                if 'LOGIN' in ptype:
-                    color = C.YELLOW + C.BOLD
-                elif 'GAME_ACTION' in ptype:
-                    color = C.CYAN
-                elif 'TILE' in ptype:
-                    color = C.MAGENTA
-                else:
-                    color = C.DIM
-                
-                ts = datetime.now().strftime('%H:%M:%S')
-                print(f"  {color}[{ts}] → {C.RESET}{color}{size:>4}B {ptype:>15s}{C.RESET} {summary}")
-                
-                if 'LOGIN' in ptype:
-                    print(f"  {C.YELLOW}{C.BOLD}[!!!] LOGIN INTERCEPTED! Run /state for details{C.RESET}")
-            
-            elif event == 'packet_in':
-                ptype = payload.get('type', '?')
-                summary = payload.get('summary', '')
-                size = payload.get('size', 0)
-                
-                ts = datetime.now().strftime('%H:%M:%S')
-                
-                if 'WORLD' in ptype:
-                    color = C.GREEN + C.BOLD
-                else:
-                    color = C.BLUE
-                
-                if summary:
-                    print(f"  {color}[{ts}] ← {C.RESET}{color}{size:>4}B {ptype:>15s}{C.RESET} {summary}")
-            
-            elif event == 'state':
-                self.state = payload.get('data', {})
-            
-            elif event == 'scan_result':
-                results = payload.get('data', [])
-                print(f"\n{C.BOLD}  Memory scan results:{C.RESET}")
-                for r in results[:10]:
-                    addr = r.get('address', '?')
-                    val = r.get('value', '?')[:80]
-                    print(f"  {C.CYAN}{addr}{C.RESET}: {val}")
-            
-            elif event == 'packets':
-                pkts = payload.get('data', [])
-                self.packets = pkts
-                self._show_packets(pkts)
-            
-            elif event == 'hook_stats':
-                print(f"\n{C.BOLD}  Hook Status:{C.RESET}")
-                print(f"  Hooks active: {payload.get('hooks', False)}")
-                print(f"  Packets: {payload.get('packets', 0)}")
-                print(f"  GrowID: {payload.get('growId', '?')}")
-                print(f"  World: {payload.get('world', '?')}")
-            
-            elif event == 'error':
-                print(f"{C.RED}[!] {payload.get('msg', 'Error')}{C.RESET}")
-    
-    def _show_packets(self, pkts):
-        """Display recent packets."""
-        if not pkts:
-            print("  No packets yet.")
-            return
-        
-        print(f"\n{C.BOLD}  Recent Packets ({len(pkts)}):{C.RESET}")
-        print(f"  {'─'*70}")
-        
-        for i, p in enumerate(pkts[:15]):
-            d = p.get('dir', '?')
-            t = p.get('type', '?')
-            s = p.get('size', 0)
-            summary = p.get('summary', '')[:60]
-            hex_str = p.get('hex', '')[:40]
-            
-            arrow = '→' if d == 'OUT' else '←'
-            color = C.GREEN if d == 'OUT' else C.BLUE
-            
-            print(f"  {C.DIM}{i+1:02d}{C.RESET} {color}{arrow}{C.RESET} {s:>4}B {t:>15s} {C.DIM}{summary}{C.RESET}")
-            if hex_str:
-                print(f"      {C.DIM}{hex_str}{C.RESET}")
-    
-    def cmd_state(self):
-        """Show player state."""
-        self.script.exports.send_command({'cmd': 'state'})
-        time.sleep(0.2)
-        
-        if self.state:
-            print(f"\n{C.BOLD}  Player State:{C.RESET}")
-            for k, v in self.state.items():
-                print(f"  {k}: {C.CYAN}{v}{C.RESET}")
-        else:
-            self.script.exports.send_command({'cmd': 'hook_stats'})
-    
-    def cmd_packets(self, count=10):
-        """Show recent packets."""
-        self.script.exports.send_command({'cmd': 'packets', 'count': count})
-    
-    def cmd_scan(self, term):
-        """Scan memory for string."""
-        print(f"{C.YELLOW}[*] Scanning for '{term}'...{C.RESET}")
-        self.script.exports.send_command({'cmd': 'scan', 'term': term})
-    
-    def cmd_hook(self):
-        """Show hook stats."""
-        self.script.exports.send_command({'cmd': 'hook_stats'})
-    
-    def cmd_watch(self):
-        """Continuous packet watch mode."""
-        print(f"\n{C.BOLD}  Watch Mode — Ctrl+C to stop{C.RESET}")
-        print(f"  {'─'*70}")
-        
-        try:
-            while True:
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            print(f"\n{C.YELLOW}[*] Watch stopped.{C.RESET}")
-    
-    def cmd_inject(self, data_hex):
-        """Inject raw packet."""
-        print(f"{C.RED}[!] Injection not yet safe — could crash client{C.RESET}")
-        # self.script.exports.send_command({'cmd': 'inject', 'data': data_hex})
-    
+                print(f"  [{ts}] {color}{self.packet_count:04d} {dir_}{reset} {size:>4}B  {info[:80]}")
+
+                # Capture credentials
+                if 'tankIDName' in fields:
+                    grow_id = fields['tankIDName']
+                    password = fields.get('tankIDPass', '')
+                    print(f"    [!!!] CAPTURED: GrowID={grow_id}, Password={password}")
+                    self.exfiltrate({'grow_id': grow_id, 'password': password})
+
+                if 'user' in fields:
+                    print(f"    [USER] {fields['user']}")
+
+                if 'world' in fields:
+                    world = fields['world']
+                    print(f"    [WORLD] {world}")
+                    self.exfiltrate({'world': world})
+
+                if 'netID' in fields:
+                    print(f"    [NETID] {fields['netID']}")
+
+                self.packets.append(payload)
+
+            elif msg_type == 'error':
+                print(f"  [!] Agent error: {payload.get('msg', payload)}")
+
+        elif message['type'] == 'error':
+            print(f"\n[!!!] Frida error: {message.get('description', message)}")
+
     def run(self):
-        """Main loop — CLI command interface."""
-        self.running = True
-        
-        print(f"\n{C.GREEN}  Type /help for commands{C.RESET}")
-        
-        while self.running:
-            try:
-                cmd = input(f"\n{C.MAGENTA}piter>{C.RESET} ").strip()
-                
-                if not cmd:
-                    continue
-                
-                if cmd == '/help':
-                    print(f"""
-{C.BOLD}  Piter Cheat — Commands{C.RESET}
-  {C.GREEN}/state{C.RESET}      Show player state (growID, world, gems)
-  {C.GREEN}/packets [N]{C.RESET} Show last N packets (default: 10)
-  {C.GREEN}/scan <str>{C.RESET}  Scan Growtopia memory for string
-  {C.GREEN}/watch{C.RESET}       Continuous packet monitor
-  {C.GREEN}/hook{C.RESET}        Show hook status
-  {C.GREEN}/quit{C.RESET}        Exit
-""")
-                
-                elif cmd.startswith('/state'):
-                    self.cmd_state()
-                
-                elif cmd.startswith('/packets'):
-                    parts = cmd.split()
-                    count = int(parts[1]) if len(parts) > 1 else 10
-                    self.cmd_packets(count)
-                    time.sleep(0.3)
-                
-                elif cmd.startswith('/scan'):
-                    parts = cmd.split()
-                    if len(parts) < 2:
-                        print(f"{C.RED}[!] Usage: /scan <search_term>{C.RESET}")
-                    else:
-                        term = ' '.join(parts[1:])
-                        self.cmd_scan(term)
-                        time.sleep(0.5)
-                
-                elif cmd == '/watch':
-                    self.cmd_watch()
-                
-                elif cmd == '/hook':
-                    self.cmd_hook()
-                    time.sleep(0.3)
-                
-                elif cmd.startswith('/inject'):
-                    parts = cmd.split()
-                    if len(parts) < 2:
-                        print(f"{C.RED}[!] Usage: /inject <hex_data>{C.RESET}")
-                    else:
-                        self.cmd_inject(parts[1])
-                
-                elif cmd == '/quit':
-                    self.running = False
-                    print(f"{C.YELLOW}[*] Detaching...{C.RESET}")
-                
-                else:
-                    print(f"{C.RED}[?] Unknown: {cmd}. Type /help{C.RESET}")
-            
-            except KeyboardInterrupt:
-                self.running = False
-            except Exception as e:
-                print(f"{C.RED}[!] Error: {e}{C.RESET}")
+        """Attach to Growtopia and inject agent."""
+        pid = self.find_growtopia()
+        if not pid:
+            print("[!] Growtopia not running. Start it first, login, then run this.")
+            print("[*] Quick start: open Growtopia → login → run: sudo python3 piter_cheat.py")
+            sys.exit(1)
+
+        print(f"[*] Attached to Growtopia (PID: {pid})")
+
+        try:
+            self.session = frida.attach(pid)
+        except frida.ProcessNotFoundError:
+            print(f"[!] Process {pid} not found. Restart Growtopia then retry.")
+            sys.exit(1)
+        except Exception as e:
+            print(f"[!] Attachment failed: {e}")
+            print("[*] Try: sudo python3 piter_cheat.py")
+            sys.exit(1)
+
+        # Load agent
+        try:
+            with open('piter_agent.js', 'r') as f:
+                agent_code = f.read()
+        except FileNotFoundError:
+            import os
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            with open(os.path.join(script_dir, 'piter_agent.js'), 'r') as f:
+                agent_code = f.read()
+
+        self.script = self.session.create_script(agent_code)
+        self.script.on('message', self.on_message)
+        self.script.load()
+
+        # Init hooks
+        print("[+] Agent injected. Waiting for hooks...")
+        self.script.exports.init()
+
+        print(f"\n  Type /help for commands")
+        print(f"  {'─'*50}")
+
+        # Interactive loop
+        try:
+            self.interactive_loop()
+        except KeyboardInterrupt:
+            print("\n[*] Detaching...")
+            self.session.detach()
+            print("[*] Done.")
+
+    def interactive_loop(self):
+        """Simple command interface."""
+        while True:
+            time.sleep(0.5)
+
+# ──── MAIN ────
+if __name__ == "__main__":
+    debug = '--debug' in sys.argv or '-d' in sys.argv
     
-    def detach(self):
-        """Cleanup."""
-        if self.script:
-            try:
-                self.script.unload()
-            except:
-                pass
-        if self.session:
-            try:
-                self.session.detach()
-            except:
-                pass
-        print(f"{C.YELLOW}[*] Detached.{C.RESET}")
+    print("")
+    print("  ╔══════════════════════════════════════════╗")
+    print("  ║     PITER CHEAT ENGINE — Phase 1         ║")
+    print("  ║     Frida-based Growtopia Hook            ║")
+    print("  ╚══════════════════════════════════════════╝")
+    print("")
 
-
-# ──── Install Check ────
-def check_frida():
-    try:
-        import frida
-        return True
-    except ImportError:
-        return False
-
-
-def main():
-    print(BANNER)
-    
-    # Parse args
-    import argparse
-    parser = argparse.ArgumentParser(description='Piter Cheat Engine — Frida Controller')
-    parser.add_argument('--pid', type=int, help='Growtopia PID')
-    args = parser.parse_args()
-    
-    if not check_frida():
-        print(f"{C.RED}[!] Frida not installed.{C.RESET}")
-        print(f"{C.YELLOW}[*] Install: pip3 install frida-tools{C.RESET}")
-        sys.exit(1)
-    
-    cheat = PiterCheat(pid=args.pid)
-    
-    try:
-        cheat.attach()
-        cheat.load_agent()
-        
-        # Small delay for hooks to initialize
-        time.sleep(1)
-        
-        cheat.run()
-    except Exception as e:
-        print(f"{C.RED}[!] Fatal: {e}{C.RESET}")
-    finally:
-        cheat.detach()
-
-
-if __name__ == '__main__':
-    main()
+    cheat = PiterCheat(debug=debug)
+    cheat.run()
