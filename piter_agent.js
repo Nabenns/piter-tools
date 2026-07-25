@@ -1,11 +1,10 @@
 /*
- * Piter Agent v8 — libSystem + CFSocket + socket fd monitoring
- * Growtopia on Mac uses CFSocket backed by libSystem write/read.
- * We enumerate ALL loaded modules, find libSystem, hook everything.
+ * Piter Agent v9 — Network.framework nw_connection hook
+ * Growtopia Mac (arm64) uses Network.framework (nw_connection_send, nw_connection_receive).
+ * This is the correct layer — bypasses libSystem entirely.
  */
 
 let send_count = 0, recv_count = 0;
-let pending = {};  // fd → callback tracking
 
 function hex(buf, n) {
     const a = new Uint8Array(buf); let s = '';
@@ -40,13 +39,13 @@ function emitPacket(dir, size, data) {
     const text = decodeText(data);
     let info = 'ENET';
     if (fields.tankIDName) {
-        info = `LOGIN ${fields.tankIDName}/${(fields.tankIDPass||'').slice(0,2)}***`;
+        info = 'LOGIN ' + fields.tankIDName + '/' + (fields.tankIDPass||'').slice(0,2) + '***';
     } else if (fields.action) {
-        info = `ACT ${fields.action}`;
+        info = 'ACT ' + fields.action;
     } else if (fields.onSuperMainStart) {
         info = 'GAME_ENTER';
     } else if (fields.world) {
-        info = `WORLD ${fields.world}`;
+        info = 'WORLD ' + fields.world;
     } else if (text) {
         info = text.slice(0, 60);
     }
@@ -54,89 +53,90 @@ function emitPacket(dir, size, data) {
     if (dir === '→') send_count++; else recv_count++;
 }
 
-// Step 0: Enumerate all available export functions
-function enumerateExports() {
-    const mods = Process.enumerateModules();
-    const result = [];
-    for (const m of mods) {
-        if (m.name.includes('System') || m.name.includes('network') || m.name.includes('CFNetwork') || m.name.includes('Socket')) {
-            result.push({name: m.name, path: m.path, base: m.base.toString()});
-        }
+// ── Safe Interceptor.attach wrapper ──
+function safeAttach(name, ptr, callbacks) {
+    if (!ptr || ptr.isNull()) {
+        send({type:'debug', msg: 'SKIP ' + name + ': null ptr'});
+        return false;
     }
-    return result;
+    try {
+        Interceptor.attach(ptr, callbacks);
+        send({type:'debug', msg: 'HOOKED ' + name});
+        return true;
+    } catch(e) {
+        send({type:'debug', msg: 'FAIL ' + name + ': ' + e.message});
+        return false;
+    }
 }
 
-// Step 1: Find libSystem and hook write/read
-function hookLibSystem() {
-    const libSystem = Process.findModuleByName('libSystem.B.dylib');
-    const libSystemPath = libSystem ? libSystem.path : null;
-    
-    send({ type: 'debug', msg: 'libSystem: ' + (libSystemPath || 'NOT FOUND') });
-    
-    // Try write
-    const writePtr = Module.findExportByName(libSystemPath, 'write');
-    if (writePtr && !writePtr.isNull()) {
-        Interceptor.attach(writePtr, {
+// ── Method 1: nw_connection_send (Network.framework) ──
+function hookNwConnectionSend() {
+    const ptr = Module.findExportByName('/System/Library/Frameworks/Network.framework/Network', 'nw_connection_send');
+    if (!ptr || ptr.isNull()) {
+        // Try without full path as fallback
+        const p2 = Module.findExportByName('Network', 'nw_connection_send');
+        if (p2 && !p2.isNull()) return safeAttach('nw_connection_send', p2, {
             onEnter(args) {
-                const fd = args[0].toInt32();
-                const buf = args[1];
-                const count = args[2].toInt32();
-                if (!buf || count < 4 || count > 65536) return;
-                const data = Memory.readByteArray(buf, Math.min(count, 4096));
+                // args[0] = nw_connection_t, args[1] = dispatch_data_t
+                const dd = args[1];
+                if (!dd || dd.isNull()) return;
+                // dispatch_data_get_size + dispatch_data_create_map
+                const getSize = Module.findExportByName('/usr/lib/system/libdispatch.dylib', 'dispatch_data_get_size');
+                const createMap = Module.findExportByName('/usr/lib/system/libdispatch.dylib', 'dispatch_data_create_map');
+                if (!getSize || getSize.isNull() || !createMap || createMap.isNull()) return;
+                const size = new NativeFunction(getSize, 'size_t', ['pointer'])(dd);
+                if (size < 4 || size > 65536) return;
+                const map = new NativeFunction(createMap, 'pointer', ['pointer', 'pointer', 'pointer'])(dd, ptr(0), ptr(0));
+                if (!map || map.isNull()) return;
+                const buf = map.add(16); // dispatch_data_s: data ptr at offset 16
+                const data = Memory.readByteArray(buf, Math.min(size, 4096));
                 if (!data) return;
-                const a = new Uint8Array(data);
-                if (a[0]===0 && a[1]===0 && a[2]===0 && a[3]===0) return;
-                emitPacket('→', count, data);
+                emitPacket('→', size, data);
             }
         });
-        return { flag: 'write', ok: true };
+        return safeAttach('nw_connection_send', ptr);
     }
-    return { flag: 'write', ok: false };
+    return safeAttach('nw_connection_send', ptr, {
+        onEnter(args) {
+            const dd = args[1];
+            if (!dd || dd.isNull()) return;
+            const sizePtr = dd.add(Process.pointerSize); // dispatch_data_t: length at +8
+            const size = Memory.readULong(sizePtr);
+            if (size < 4 || size > 65536) return;
+            const bufPtr = dd.add(Process.pointerSize * 2);
+            const data = Memory.readByteArray(bufPtr, Math.min(size, 4096));
+            if (!data) return;
+            emitPacket('→', size, data);
+        }
+    });
 }
 
-function hookLibSystemRecv() {
-    const libSystem = Process.findModuleByName('libSystem.B.dylib');
-    const libSystemPath = libSystem ? libSystem.path : null;
-    
-    // Try recv
-    const recvPtr = Module.findExportByName(libSystemPath, 'recv');
-    if (recvPtr && !recvPtr.isNull()) {
-        Interceptor.attach(recvPtr, {
-            onEnter(args) { this.buf = args[1]; },
-            onLeave(retval) {
-                const count = retval.toInt32();
-                if (count < 4 || count > 65536 || !this.buf) return;
-                const data = Memory.readByteArray(this.buf, Math.min(count, 4096));
-                if (!data) return;
-                emitPacket('←', count, data);
-            }
+// ── Method 2: nw_connection_receive (Network.framework) ──
+function hookNwConnectionReceive() {
+    const ptr = Module.findExportByName('/System/Library/Frameworks/Network.framework/Network', 'nw_connection_receive');
+    if (!ptr || ptr.isNull()) {
+        const p2 = Module.findExportByName('Network', 'nw_connection_receive');
+        if (p2 && !p2.isNull()) return safeAttach('nw_connection_receive', p2, {
+            onEnter(args) {
+                this.completionHandler = args[1]; // nw_connection_receive_completion_t block
+            },
+            onLeave(retval) {}
         });
-        return { flag: 'recv', ok: true };
+        return false;
     }
-
-    // Try read
-    const readPtr = Module.findExportByName(libSystemPath, 'read');
-    if (readPtr && !readPtr.isNull()) {
-        Interceptor.attach(readPtr, {
-            onEnter(args) { this.buf = args[1]; },
-            onLeave(retval) {
-                const count = retval.toInt32();
-                if (count < 4 || count > 65536 || !this.buf) return;
-                const data = Memory.readByteArray(this.buf, Math.min(count, 4096));
-                if (!data) return;
-                emitPacket('←', count, data);
-            }
-        });
-        return { flag: 'read', ok: true };
-    }
-    return { flag: 'recv/read', ok: false };
+    return safeAttach('nw_connection_receive', ptr, {
+        onEnter(args) {
+            this.completionHandler = args[1];
+        },
+        onLeave(retval) {}
+    });
 }
 
-// Step 2: Hook sendto/recvfrom
-function hookSendto() {
-    const ptr = Module.findExportByName(null, 'sendto');
-    if (!ptr || ptr.isNull()) return { flag: 'sendto', ok: false };
-    Interceptor.attach(ptr, {
+// ── Method 3: CFWriteStreamWrite (CoreFoundation) ──
+function hookCFWriteStreamWrite() {
+    const ptr = Module.findExportByName('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation', 'CFWriteStreamWrite');
+    if (!ptr || ptr.isNull()) return false;
+    return safeAttach('CFWriteStreamWrite', ptr, {
         onEnter(args) {
             const buf = args[1];
             const count = args[2].toInt32();
@@ -146,13 +146,13 @@ function hookSendto() {
             emitPacket('→', count, data);
         }
     });
-    return { flag: 'sendto', ok: true };
 }
 
-function hookRecvfrom() {
-    const ptr = Module.findExportByName(null, 'recvfrom');
-    if (!ptr || ptr.isNull()) return { flag: 'recvfrom', ok: false };
-    Interceptor.attach(ptr, {
+// ── Method 4: CFReadStreamRead ──
+function hookCFReadStreamRead() {
+    const ptr = Module.findExportByName('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation', 'CFReadStreamRead');
+    if (!ptr || ptr.isNull()) return false;
+    return safeAttach('CFReadStreamRead', ptr, {
         onEnter(args) { this.buf = args[1]; },
         onLeave(retval) {
             const count = retval.toInt32();
@@ -162,118 +162,92 @@ function hookRecvfrom() {
             emitPacket('←', count, data);
         }
     });
-    return { flag: 'recvfrom', ok: true };
 }
 
-// Step 3: Hook connect() to find the socket fd, then hook write() with fd filter
-function hookConnect() {
-    const ptr = Module.findExportByName(null, 'connect');
-    if (!ptr || ptr.isNull()) return false;
-    
-    Interceptor.attach(ptr, {
+// ── Method 5: Last resort — socket write/read via syscall ──
+function hookSyscallWrite() {
+    // syscall(4, fd, buf, count) = write
+    const libSystem = Module.findExportByName(null, 'syscall');
+    if (!libSystem || libSystem.isNull()) return false;
+    return safeAttach('syscall(write)', libSystem, {
         onEnter(args) {
-            // args[0] = fd, args[1] = sockaddr
-            this.fd = args[0].toInt32();
+            const num = args[0].toInt32();
+            if (num !== 4) return; // 4 = SYS_write on arm64
+            const buf = args[2];
+            const count = args[3].toInt32();
+            if (!buf || count < 4 || count > 65536) return;
+            const data = Memory.readByteArray(buf, Math.min(count, 4096));
+            if (!data) return;
+            const a = new Uint8Array(data);
+            if (a[0]===0 && a[1]===0 && a[2]===0 && a[3]===0) return;
+            emitPacket('→', count, data);
+        }
+    });
+}
+
+function hookSyscallRead() {
+    const libSystem = Module.findExportByName(null, 'syscall');
+    if (!libSystem || libSystem.isNull()) return false;
+    return safeAttach('syscall(read)', libSystem, {
+        onEnter(args) {
+            const num = args[0].toInt32();
+            if (num !== 3) return; // 3 = SYS_read on arm64
+            this.buf = args[2];
         },
         onLeave(retval) {
-            if (retval.toInt32() !== 0) return;
-            const fd = this.fd;
-            if (fd < 3) return;
-            // Read sockaddr to get port
-            try {
-                const sa = this.context.rdi; // args[1]
-                if (sa) {
-                    const family = Memory.readUShort(sa.add(1)); // sa_family (offset 1 in sockaddr)
-                    const port = ((Memory.readU8(sa.add(2)) << 8) | Memory.readU8(sa.add(3)));
-                    send({ type: 'debug', msg: `connect fd=${fd} port=${port}` });
-                    if (port === 17091) {
-                        pending[fd] = { port: 17091, time: Date.now() };
-                        send({ type: 'connected', fd, port: 17091 });
-                    }
-                }
-            } catch(e) {}
+            const count = retval.toInt32();
+            if (count < 4 || count > 65536 || !this.buf) return;
+            const data = Memory.readByteArray(this.buf, Math.min(count, 4096));
+            if (!data) return;
+            emitPacket('←', count, data);
         }
     });
-    return true;
 }
 
-// Step 4: Hook write() with FD tracking — only intercept known GT socket
-function hookWriteFiltered() {
-    const libSystem = Process.findModuleByName('libSystem.B.dylib');
-    const libSystemPath = libSystem ? libSystem.path : null;
-    const writePtr = Module.findExportByName(libSystemPath, 'write');
-    if (!writePtr || writePtr.isNull()) return false;
-    
-    Interceptor.attach(writePtr, {
-        onEnter(args) {
-            const fd = args[0].toInt32();
-            const buf = args[1];
-            const count = args[2].toInt32();
-            if (!buf || count < 4 || count > 65536) return;
-            // Filter: only known GT socket fd
-            if (pending[fd] && pending[fd].port === 17091) {
-                const data = Memory.readByteArray(buf, Math.min(count, 4096));
-                if (!data) return;
-                emitPacket('→', count, data);
-            }
-        }
-    });
-    return true;
-}
-
+// ── Main init ──
 rpc.exports = {
     init() {
         send_count = 0; recv_count = 0;
-        pending = {};
+        const results = {};
         
-        const results = { modules: enumerateExports(), hooks: {} };
-
-        // Hook connect to find GT socket
-        results.hooks.connect = hookConnect();
-
-        // Hook libc send
-        results.hooks.libsend = hookLibSystem();
-        if (!results.hooks.libsend.ok) results.hooks.sendto = hookSendto();
-
-        // Hook libc recv
-        results.hooks.librecv = hookLibSystemRecv();
-        if (!results.hooks.librecv.ok) results.hooks.recvfrom = hookRecvfrom();
-
-        // Hook write with fd filter (bonus - if connect worked)
-        if (results.hooks.connect) {
-            try { hookWriteFiltered(); results.hooks.writeFiltered = true; } catch(e) {}
-        }
-
-        // Hook CFSocketSendData as last resort
-        try {
-            const cfPtr = Module.findExportByName(null, 'CFSocketSendData');
-            if (cfPtr && !cfPtr.isNull()) {
-                Interceptor.attach(cfPtr, {
-                    onEnter(args) {
-                        const dataPtr = args[1];
-                        if (!dataPtr) return;
-                        const lenPtr = Memory.readPointer(dataPtr);
-                        if (!lenPtr) return;
-                        const len = Memory.readUInt(lenPtr);
-                        if (len < 4 || len > 65536) return;
-                        const bufPtr = dataPtr.add(Process.pointerSize);
-                        const data = Memory.readByteArray(bufPtr, Math.min(len, 4096));
-                        if (!data) return;
-                        emitPacket('→', len, data);
-                    }
-                });
-                results.hooks.CFSocket = true;
+        // Enumerate available modules for debug
+        const mods = Process.enumerateModules();
+        const netMods = [];
+        for (const m of mods) {
+            if (m.name.toLowerCase().includes('network') || 
+                m.name.toLowerCase().includes('system') ||
+                m.name.toLowerCase().includes('corefoundation') ||
+                m.name.toLowerCase().includes('dispatch')) {
+                netMods.push(m.name);
             }
-        } catch(e) {}
-
-        send({ type: 'ready',
-            sendHooked: results.hooks.libsend.ok || results.hooks.sendto.ok,
-            recvHooked: results.hooks.librecv.ok || results.hooks.recvfrom.ok,
+        }
+        send({type:'debug', msg:'Relevant modules: ' + JSON.stringify(netMods.slice(0,10))});
+        
+        // Try all hook methods — one will work
+        results.nw_send = hookNwConnectionSend();
+        results.nw_recv = hookNwConnectionReceive();
+        results.cf_write = hookCFWriteStreamWrite();
+        results.cf_read = hookCFReadStreamRead();
+        
+        // If nothing worked, fall back to raw syscalls
+        if (!results.nw_send && !results.cf_write) {
+            results.syscall_write = hookSyscallWrite();
+            results.syscall_read = hookSyscallRead();
+        }
+        
+        const sendOk = results.nw_send || results.cf_write || results.syscall_write;
+        const recvOk = results.nw_recv || results.cf_read || results.syscall_read;
+        
+        send({
+            type:'ready',
+            sendHooked: sendOk,
+            recvHooked: recvOk,
             results
         });
+        
         return results;
     },
-
+    
     stats() { return { send_count, recv_count }; }
 };
 
