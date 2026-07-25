@@ -92,20 +92,43 @@ function scanStrings(term, maxResults) {
 }
 
 // ──── ENet Send Hook ────
+function htons(port) {
+    return ((port & 0xff) << 8) | ((port >> 8) & 0xff);
+}
+
 function hookEnetSend() {
     try {
-        // Look for ENet send function signature
-        // enet_peer_send(ENetPeer*, enet_uint8 channelID, ENetPacket*)
-        // Pattern: push channel count, call send, etc.
-        
-        const enetModule = Process.findModuleByName('Growtopia');
-        if (!enetModule) {
-            console.log('[!] Growtopia module not found');
-            return false;
+        // Try multiple module names (macOS vs Windows vs Linux)
+        let moduleNames = ['Growtopia', 'Growtopia.app', null, 'Growtopia.exe'];
+        let enetModule = null;
+        for (const name of moduleNames) {
+            try { enetModule = Process.findModuleByName(name); if (enetModule) break; } catch(e) {}
         }
         
-        // Try to find ENet send by scanning for common patterns
-        // We'll hook sendto() as fallback — intercept all UDP writes
+        if (!enetModule) {
+            // On macOS, the main executable might not be found by name — try enumerate
+            try {
+                const mods = Process.enumerateModules();
+                for (const m of mods) {
+                    if (m.name.toLowerCase().includes('growtopia') || 
+                        m.name.toLowerCase().includes('gt') ||
+                        m.path.toLowerCase().includes('growtopia')) {
+                        enetModule = m;
+                        break;
+                    }
+                }
+            } catch(e) {}
+            
+            if (!enetModule) {
+                console.log('[!] Module detection failed — falling back to system hooks only');
+            } else {
+                console.log('[+] Found module: ' + enetModule.name + ' @ ' + enetModule.base);
+            }
+        }
+        
+        let hooksOk = 0;
+        
+        // Hook sendto() — intercept all UDP writes
         const sendtoPtr = Module.findExportByName(null, 'sendto');
         if (sendtoPtr) {
             Interceptor.attach(sendtoPtr, {
@@ -119,14 +142,16 @@ function hookEnetSend() {
                 },
                 onLeave(retval) {
                     try {
-                        // Check if this is UDP to port 17091
-                        if (this.addrlen >= 8) {
+                        if (this.addrlen >= 8 && this.len > 0) {
                             const family = this.addr.readU16();
-                            if (family === 2) { // AF_INET
-                                const port = ((this.addr.add(2).readU8() << 8) | this.addr.add(3).readU8());
-                                if (port === htons(17091) || port === 17091 || port === 43847) {
-                                    // Game packet! Parse it.
-                                    const data = this.buf.readByteArray(Math.min(this.len, 512));
+                            if (family === 2) {
+                                // Read port correctly (network byte order)
+                                const rawPort = this.addr.add(2).readU16();
+                                // Normalize port regardless of endianness
+                                const portBigEndian = ((rawPort >> 8) & 0xff) | ((rawPort & 0xff) << 8);
+                                if (portBigEndian === 17091 || rawPort === 17091 || portBigEndian === 43847 || rawPort === 43847) {
+                                    const len = Math.min(this.len, 512);
+                                    const data = this.buf.readByteArray(len);
                                     handleOutboundPacket(data);
                                 }
                             }
@@ -134,37 +159,49 @@ function hookEnetSend() {
                     } catch (e) {}
                 }
             });
+            hooksOk++;
             console.log('[+] sendto() hooked');
+        } else {
+            console.log('[!] sendto() not found');
         }
         
         // Hook recvfrom for inbound
         const recvfromPtr = Module.findExportByName(null, 'recvfrom');
         if (recvfromPtr) {
             Interceptor.attach(recvfromPtr, {
+                onEnter(args) {
+                    this.buf = args[1];
+                    this.len = args[2].toInt32();
+                    this.addr = args[4];
+                    this.addrlen = args[5].toInt32();
+                },
                 onLeave(retval) {
-                    if (retval.toInt32() <= 0) return;
+                    const ret = retval.toInt32();
+                    if (ret <= 0 || !this.addrlen || this.addrlen < 8) return;
                     try {
-                        if (this.addr && this.addrlen >= 8) {
-                            const family = this.addr.readU16();
-                            if (family === 2) {
-                                const port = ((this.addr.add(2).readU8() << 8) | this.addr.add(3).readU8());
-                                if (port === htons(17091) || port === 17091 || port === 43847) {
-                                    const len = retval.toInt32();
-                                    const data = this.buf.readByteArray(Math.min(len, 2048));
-                                    handleInboundPacket(data);
-                                }
+                        const family = this.addr.readU16();
+                        if (family === 2) {
+                            const rawPort = this.addr.add(2).readU16();
+                            const portBigEndian = ((rawPort >> 8) & 0xff) | ((rawPort & 0xff) << 8);
+                            if (portBigEndian === 17091 || rawPort === 17091 || portBigEndian === 43847 || rawPort === 43847) {
+                                const len = Math.min(ret, 2048);
+                                const data = this.buf.readByteArray(len);
+                                handleInboundPacket(data);
                             }
                         }
                     } catch (e) {}
                 }
             });
+            hooksOk++;
             console.log('[+] recvfrom() hooked');
+        } else {
+            console.log('[!] recvfrom() not found');
         }
         
-        state.hooksActive = true;
-        return true;
+        state.hooksActive = (hooksOk > 0);
+        return state.hooksActive;
     } catch (e) {
-        console.log('[!] Hook error: ' + e);
+        console.log('[!] Hook error: ' + e.message + '\\n' + e.stack);
         return false;
     }
 }
