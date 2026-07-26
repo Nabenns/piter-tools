@@ -1,0 +1,685 @@
+_config_version: 29
+agent:
+  api_max_retries: 3
+  clarify_timeout: 600
+  coding_context: auto
+  disabled_toolsets: []
+  environment_hint: ''
+  environment_probe: true
+  gateway_auto_continue_freshness: 3600
+  gateway_notify_interval: 180
+  gateway_timeout: 1800
+  gateway_timeout_warning: 900
+  image_input_mode: auto
+  max_turns: 90
+  reasoning_effort: xhigh
+  restart_drain_timeout: 180
+  service_tier: ''
+  task_completion_guidance: true
+  tool_use_enforcement: auto
+approvals:
+  cron_mode: deny
+  destructive_slash_confirm: false
+  mcp_reload_confirm: true
+  mode: manual
+  timeout: 60
+auxiliary:
+  approval:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 30
+  compression:
+    api_key: sk-641f591451b7f7a6-imcd2g-43b3bd3d
+    base_url: https://freeai.jembatanai.com/v1
+    extra_body: {}
+    model: glm-5.2
+    provider: jembatanai
+    timeout: 120
+  curator:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 600
+  kanban_decomposer:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 180
+  mcp:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 30
+  monitor:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 60
+  profile_describer:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 60
+  skills_hub:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 30
+  title_generation:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 30
+  triage_specifier:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 120
+  tts_audio_tags:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 30
+  vision:
+    api_key: ''
+    base_url: ''
+    download_timeout: 30
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 120
+  web_extract:
+    api_key: ''
+    base_url: ''
+    extra_body: {}
+    model: ''
+    provider: auto
+    timeout: 360
+bedrock:
+  discovery:
+    enabled: true
+    provider_filter: []
+    refresh_interval: 3600
+  guardrail:
+    guardrail_identifier: ''
+    guardrail_version: ''
+    stream_processing_mode: async
+    trace: disabled
+  region: ''
+browser:
+  allow_private_urls: false
+  auto_local_for_private_urls: true
+  camofox:
+    adopt_existing_tab: false
+    loopback_host_alias: host.docker.internal
+    managed_persistence: false
+    rewrite_loopback_urls: false
+    session_key: ''
+    user_id: ''
+  cdp_url: ''
+  command_timeout: 30
+  dialog_policy: must_respond
+  dialog_timeout_s: 300
+  engine: auto
+  inactivity_timeout: 120
+  record_sessions: false
+checkpoints:
+  auto_prune: true
+  delete_orphans: true
+  enabled: false
+  max_file_size_mb: 10
+  max_snapshots: 20
+  max_total_size_mb: 500
+  min_interval_hours: 24
+  retention_days: 7
+code_execution:
+  mode: project
+command_allowlist:
+- git branch force delete
+- recursive delete
+- in-place edit of system config
+- delete in root path
+- stop/restart hermes gateway (kills running agents)
+- execute_code
+- force kill processes (killall -KILL)
+- force kill processes
+- SQL DROP
+- overwrite system config
+- shell command via -c/-lc flag
+- docker compose restart/stop/kill/down (container lifecycle)
+- in-place edit of Hermes config/env
+- script execution via -e/-c flag
+- overwrite system file via tee
+- copy/move file into system config path
+- docker restart/stop/kill (container lifecycle)
+- SQL TRUNCATE
+- script execution via heredoc
+- overwrite system file via redirection
+- pipe remote content to shell
+- overwrite project env/config via redirection
+- chmod +x followed by immediate execution
+- xargs with rm
+- stop/restart system service
+- SQL DELETE without WHERE
+- git force push (rewrites remote history)
+- overwrite project env/config file
+compression:
+  abort_on_summary_failure: false
+  codex_gpt55_autoraise: true
+  enabled: true
+  hygiene_hard_message_limit: 400
+  model: glm-5.2
+  protect_first_n: 3
+  protect_last_n: 20
+  provider: jembatanai
+  target_ratio: 0.1
+  threshold: 0.8
+context:
+  engine: compressor
+credential_pool_strategies: {}
+cron:
+  max_parallel_jobs: null
+  wrap_response: true
+curator:
+  archive_after_days: 90
+  backup:
+    enabled: true
+    keep: 5
+  enabled: true
+  interval_hours: 168
+  min_idle_hours: 2
+  prune_builtins: true
+  stale_after_days: 30
+dashboard:
+  basic_auth:
+    password: ''
+    password_hash: ''
+    secret: ''
+    session_ttl_seconds: 0
+    username: ''
+  oauth:
+    client_id: ''
+    portal_url: ''
+  public_url: ''
+  show_token_analytics: false
+  theme: default
+delegation:
+  api_key: ''
+  api_mode: ''
+  base_url: ''
+  child_timeout_seconds: 600
+  inherit_mcp_toolsets: true
+  max_concurrent_children: 3
+  max_iterations: 50
+  max_spawn_depth: 1
+  model: ''
+  orchestrator_enabled: true
+  provider: ''
+  reasoning_effort: ''
+  subagent_auto_approve: false
+discord:
+  allow_any_attachment: false
+  allowed_channels: ''
+  auto_thread: false
+  channel_prompts:
+    '1515748563768971285': "Ini channel tanya-trading buat bot trading Bybit. SEBELUM\
+      \ jawab soal posisi/saldo/winrate/PnL/strategi, WAJIB jalanin dulu: cd /root/trading-bot\
+      \ && . .venv/bin/activate && python3 status.py \u2014 itu ngasih saldo live,\
+      \ posisi terbuka, winrate, PnL, strategi aktif. Buat detail alasan tiap trade\
+      \ baca /root/trading-bot/journal.jsonl. Jawab santai bahasa Indonesia. Kalau\
+      \ user minta ubah leverage/strategi, edit /root/trading-bot/params.json (bump\
+      \ version + update notes). Kalau user minta STOP, bikin file kosong /root/trading-bot/HALTED;\
+      \ lanjut lagi hapus file itu. JANGAN ngarang angka \u2014 selalu jalanin status.py\
+      \ dulu."
+    '1516348996170551337': 'Ini channel manage project LAPAKFLOW. Lokasi kode: /root/shopibot123
+      (nama folder lama ''shopibot123'' tapi project-nya Lapakflow). Lapakflow = Shopee
+      automation dashboard buat seller produk digital: konek via session cookie, auto-deliver
+      ke buyer lewat Shopee Chat begitu order dibayar. Stack: Next.js 15 + TS + shadcn/ui,
+      better-auth, BullMQ+Redis, Postgres+Drizzle, deploy Docker Compose + Caddy.
+      Container prod: lapakflow_web_prod, lapakflow_worker_prod, lapakflow_postgres_prod,
+      lapakflow_redis_prod. Backup SQL harian di /root/backups/. SEBELUM jawab soal
+      status/health/log, cek dulu kondisi nyata: docker ps buat status container,
+      docker logs <container> --tail 50 buat log, dan baca file di /root/shopibot123
+      sebelum klaim apapun soal kode. Jawab santai bahasa Indonesia. JANGAN ngarang
+      status atau output, selalu verifikasi via docker/file dulu.'
+    '1516349012976865360': 'Ini channel manage project LAPAKGRAM. Lokasi kode: /root/lapakgram.
+      Lapakgram = multi-tenant SaaS buat jualan produk digital di TELEGRAM: tiap merchant
+      dapet bot Telegram sendiri + mini app e-commerce + dashboard web. Stack: Next.js
+      15 (apps/web), Go + gotgbot (apps/bot), Drizzle + Postgres 16 dengan RLS multi-tenancy
+      (set app.current_merchant_id per transaction), MinIO buat storage. Container:
+      lapakgram-web-1, lapakgram-postgres-1, lapakgram-minio-1. CATATAN: lapakgram-web-1
+      pernah unhealthy, selalu cek docker ps dulu. SEBELUM jawab soal status/health/log,
+      verifikasi nyata: docker ps, docker logs <container> --tail 50, dan baca file
+      di /root/lapakgram sebelum klaim apapun. Soal RLS/multi-tenancy baca README.md
+      + packages/db/src/rls.ts. Jawab santai bahasa Indonesia. JANGAN ngarang status
+      atau output, selalu verifikasi via docker/file dulu.'
+  dm_role_auth_guild: ''
+  free_response_channels: 1516348996170551337,1514906014850224218,1524823630557483229
+  history_backfill: true
+  history_backfill_limit: 50
+  max_attachment_bytes: 33554432
+  reactions: true
+  require_mention: true
+  server_actions: ''
+  thread_require_mention: false
+  voice_fx:
+    ack_enabled: true
+    ack_phrases:
+    - Let me look into that.
+    - One moment.
+    - Checking on that now.
+    - Give me a sec.
+    - On it.
+    ambient_enabled: true
+    ambient_gain: 0.18
+    ambient_path: ''
+    duck_gain: 0.06
+    enabled: false
+    speech_gain: 1.0
+display:
+  bell_on_complete: false
+  busy_input_mode: queue
+  compact: false
+  copy_shortcut: auto
+  ephemeral_system_ttl: 0
+  file_mutation_verifier: true
+  final_response_markdown: strip
+  inline_diffs: true
+  interface: cli
+  interim_assistant_messages: true
+  language: en
+  persistent_output: true
+  persistent_output_max_lines: 200
+  personality: ''
+  platforms:
+    discord:
+      streaming: false
+    telegram:
+      streaming: true
+  resume_display: full
+  resume_exchanges: 10
+  resume_max_assistant_chars: 200
+  resume_max_assistant_lines: 3
+  resume_max_user_chars: 300
+  resume_skip_tool_only: true
+  runtime_footer:
+    enabled: false
+    fields:
+    - model
+    - context_pct
+    - cwd
+  show_cost: false
+  show_reasoning: false
+  skin: default
+  streaming: false
+  timestamps: false
+  tool_preview_length: 0
+  tool_progress_command: false
+  tool_progress_overrides: {}
+  tui_agents_nudge: true
+  tui_auto_resume_recent: false
+  tui_status_indicator: kaomoji
+  turn_completion_explainer: true
+  user_message_preview:
+    first_lines: 2
+    last_lines: 2
+fallback_providers: []
+file_read_max_chars: 100000
+gateway:
+  media_delivery_allow_dirs: []
+  strict: false
+  trust_recent_files: true
+  trust_recent_files_seconds: 600
+goals:
+  max_turns: 20
+honcho: {}
+hooks: {}
+hooks_auto_accept: false
+human_delay:
+  max_ms: 2500
+  min_ms: 800
+  mode: 'off'
+kanban:
+  auto_decompose: true
+  auto_decompose_per_tick: 3
+  default_assignee: ''
+  dispatch_in_gateway: true
+  dispatch_interval_seconds: 60
+  dispatch_stale_timeout_seconds: 14400
+  failure_limit: 2
+  max_in_progress_per_profile: null
+  orchestrator_profile: ''
+  worker_log_backup_count: 1
+  worker_log_rotate_bytes: 2097152
+logging:
+  backup_count: 3
+  level: INFO
+  max_size_mb: 5
+lsp:
+  enabled: true
+  install_strategy: auto
+  servers: {}
+  wait_mode: document
+  wait_timeout: 5.0
+matrix:
+  allowed_rooms: ''
+  free_response_rooms: ''
+  require_mention: true
+mattermost:
+  allowed_channels: ''
+  channel_prompts: {}
+  free_response_channels: ''
+  require_mention: true
+max_concurrent_sessions: null
+mcp_servers:
+  chrome-devtools:
+    args:
+    - chrome-devtools-mcp@latest
+    - --headless
+    - --isolated
+    - --executablePath
+    - /opt/chrome-for-testing/chrome/linux-150.0.7871.24/chrome-linux64/chrome
+    command: npx
+    connect_timeout: 60
+    enabled: true
+    timeout: 120
+  context7:
+    args:
+    - -y
+    - '@upstash/context7-mcp'
+    - --connect-timeout
+    - '120'
+    - --yes
+    command: npx
+    connect_timeout: 120
+    enabled: false
+  mac-bridge:
+    args:
+    - /root/piter-tools/mac_mcp.py
+    command: python3
+    enabled: true
+    tools: all
+  qdrant:
+    args:
+    - /root/.hermes/qdrant_mcp_server.py
+    - --yes
+    command: /usr/local/lib/hermes-agent/venv/bin/python3
+    enabled: true
+  sequential-thinking:
+    args:
+    - -y
+    - '@modelcontextprotocol/server-sequential-thinking'
+    - --yes
+    command: npx
+    enabled: true
+  sqlite:
+    args:
+    - mcp-server-sqlite
+    command: /root/.local/bin/uvx
+    enabled: true
+  time:
+    args:
+    - mcp-server-time
+    command: /root/.local/bin/uvx
+    enabled: true
+memory:
+  memory_char_limit: 2200
+  memory_enabled: true
+  provider: ''
+  user_char_limit: 1375
+  user_profile_enabled: true
+  write_approval: false
+model:
+  context_length: 200000
+  default: glm-5.2
+  max_tokens: 8192
+  provider: jembatanai
+model_catalog:
+  enabled: true
+  providers: {}
+  ttl_hours: 1
+  url: https://hermes-agent.nousresearch.com/docs/api/model-catalog.json
+network:
+  force_ipv4: false
+onboarding:
+  profile_build: ask
+  seen:
+    busy_input_prompt: true
+    profile_build_offered: true
+    tool_progress_prompt: true
+openrouter:
+  min_coding_score: 0.65
+  response_cache: true
+  response_cache_ttl: 300
+paste_collapse_char_threshold: 2000
+paste_collapse_threshold: 5
+paste_collapse_threshold_fallback: 5
+personalities: {}
+prefill_messages_file: ''
+privacy:
+  redact_pii: false
+prompt_caching:
+  cache_ttl: 5m
+providers:
+  9router:
+    api_key: sk-83266ebfc3546441-dnj82z-0161d33c
+    base_url: https://9router.bensserver.cloud/v1
+    discover_models: true
+    type: custom
+  freeunliz:
+    api_key: sk-641f591451b7f7a6-imcd2g-43b3bd3d
+    base_url: https://freeai.jembatanai.com/v1
+    discover_models: true
+    models:
+      claude-sonnet-5: {}
+      fb/deepseek/deepseek-v4-flash: {}
+      fb/deepseek/deepseek-v4-pro: {}
+      fb/minimax/minimax-m3: {}
+      fb/moonshotai/kimi-k2.7-code: {}
+      glm-5.2: glm-5
+    type: custom
+  geraikita:
+    api_key: gk-af380a87f442ced7a619390a910900850968fe75c0b11ec3
+    base_url: https://api.geraikita.com/v1/claude
+    discover_models: true
+    type: custom
+  jembatanai:
+    api_key: sk-641f591451b7f7a6-imcd2g-43b3bd3d
+    base_url: https://freeai.jembatanai.com/v1
+    default_model: glm-5.2
+    discover_models: true
+    models:
+      claude-sonnet-5: {}
+      fb/deepseek/deepseek-v4-flash: {}
+      fb/deepseek/deepseek-v4-pro: {}
+      fb/mimo/mimo-v2.5: {}
+      fb/mimo/mimo-v2.5-pro: {}
+      fb/minimax/minimax-m3: {}
+      fb/moonshotai/kimi-k2.7-code: {}
+      glm-5.2: glm-5
+    type: custom
+quick_commands: {}
+secrets:
+  bitwarden:
+    access_token_env: BWS_ACCESS_TOKEN
+    auto_install: true
+    cache_ttl_seconds: 300
+    enabled: false
+    override_existing: true
+    project_id: ''
+    server_url: ''
+security:
+  acked_advisories: []
+  allow_lazy_installs: true
+  allow_private_urls: false
+  redact_secrets: false
+  tirith_enabled: true
+  tirith_fail_open: true
+  tirith_path: tirith
+  tirith_timeout: 5
+  website_blocklist:
+    domains: []
+    enabled: false
+    shared_files: []
+sessions:
+  auto_prune: false
+  min_interval_hours: 24
+  retention_days: 90
+  vacuum_after_prune: true
+  write_json_snapshots: false
+skills:
+  external_dirs: []
+  guard_agent_created: false
+  inline_shell: false
+  inline_shell_timeout: 10
+  template_vars: true
+  write_approval: false
+slack:
+  allowed_channels: ''
+  channel_prompts: {}
+  free_response_channels: ''
+  require_mention: true
+streaming:
+  buffer_threshold: 24
+  cursor: " \u2589"
+  edit_interval: 0.8
+  enabled: false
+  fresh_final_after_seconds: 60.0
+  transport: auto
+stt:
+  elevenlabs:
+    diarize: false
+    language_code: ''
+    model_id: scribe_v2
+    tag_audio_events: false
+  enabled: true
+  local:
+    language: ''
+    model: base
+  mistral:
+    model: voxtral-mini-latest
+  openai:
+    model: whisper-1
+  provider: local
+telegram:
+  allowed_chats: ''
+  channel_prompts: {}
+  reactions: false
+terminal:
+  auto_source_bashrc: true
+  backend: local
+  container_cpu: 1
+  container_disk: 51200
+  container_memory: 5120
+  container_persistent: true
+  cwd: .
+  daytona_image: nikolaik/python-nodejs:python3.11-nodejs20
+  docker_env: {}
+  docker_extra_args: []
+  docker_forward_env: []
+  docker_image: nikolaik/python-nodejs:python3.11-nodejs20
+  docker_mount_cwd_to_workspace: false
+  docker_run_as_host_user: false
+  docker_volumes: []
+  env_passthrough: []
+  modal_image: nikolaik/python-nodejs:python3.11-nodejs20
+  modal_mode: auto
+  persistent_shell: true
+  shell_init_files: []
+  singularity_image: docker://nikolaik/python-nodejs:python3.11-nodejs20
+  timeout: 180
+timezone: ''
+tool_loop_guardrails:
+  hard_stop_after:
+    exact_failure: 5
+    idempotent_no_progress: 5
+    same_tool_failure: 8
+  hard_stop_enabled: false
+  warn_after:
+    exact_failure: 2
+    idempotent_no_progress: 2
+    same_tool_failure: 3
+  warnings_enabled: true
+tool_output:
+  max_bytes: 50000
+  max_line_length: 2000
+  max_lines: 2000
+tools:
+  tool_search:
+    enabled: auto
+    max_search_limit: 20
+    search_default_limit: 5
+    threshold_pct: 10
+toolsets:
+- hermes-cli
+tts:
+  edge:
+    voice: en-US-AriaNeural
+  elevenlabs:
+    model_id: eleven_multilingual_v2
+    voice_id: pNInz6obpgDQGcFmaJgB
+  gemini:
+    audio_tags: false
+    model: gemini-2.5-flash-preview-tts
+    persona_prompt_file: ''
+    voice: Kore
+  mistral:
+    model: voxtral-mini-tts-2603
+    voice_id: c69964a6-ab8b-4f8a-9465-ec0925096ec8
+  neutts:
+    device: cpu
+    model: neuphonic/neutts-air-q4-gguf
+    ref_audio: ''
+    ref_text: ''
+  openai:
+    model: gpt-4o-mini-tts
+    voice: alloy
+  piper:
+    voice: en_US-lessac-medium
+  provider: edge
+  xai:
+    bit_rate: 128000
+    language: en
+    sample_rate: 24000
+    voice_id: eve
+updates:
+  backup_keep: 5
+  non_interactive_local_changes: stash
+  pre_update_backup: false
+voice:
+  auto_tts: false
+  beep_enabled: true
+  max_recording_seconds: 120
+  record_key: ctrl+b
+  silence_duration: 3.0
+  silence_threshold: 200
+web:
+  backend: ''
+  extract_backend: ''
+  search_backend: ''
+whatsapp: {}
+x_search:
+  model: grok-4.20-reasoning
+  retries: 2
+  timeout_seconds: 180
