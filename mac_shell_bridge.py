@@ -17,6 +17,7 @@ import time
 import platform
 import shlex
 import signal
+import socket
 
 
 HOST = "0.0.0.0"
@@ -193,7 +194,12 @@ def main():
     print(f"    POST /read    → read file")
     print(f"  {'─'*40}\n")
     
-    server = http.server.HTTPServer((HOST, PORT), BridgeHandler)
+    import socketserver
+    class ReuseServer(socketserver.TCPServer):
+        allow_reuse_address = True
+    
+    server = http.server.HTTPServer((HOST, PORT), BridgeHandler, bind_and_activate=True)
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
     # Graceful shutdown
     def shutdown(sig, frame):
