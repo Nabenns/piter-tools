@@ -57,8 +57,7 @@ async def mac_exec_via_relay(command, timeout=30):
         ws = await asyncio.wait_for(
             websockets.connect(
                 RELAY_URL, 
-                extra_headers={"X-Token": RELAY_TOKEN},
-                additional_headers={"Host": "103.253.213.178:8080"}
+                extra_headers={"X-Token": RELAY_TOKEN}
             ),
             timeout=5
         )
