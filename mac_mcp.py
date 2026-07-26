@@ -19,8 +19,7 @@ import urllib.error
 
 # ──── Config ────
 BRIDGE_URLS = [
-    "http://bore.pub:37354",    # bore tunnel (update kalau restart)
-    "http://localhost:9999",     # fallback
+    "http://bore.pub:1657",     # bore tunnel (current)
 ]
 
 def _detect_bridge():
